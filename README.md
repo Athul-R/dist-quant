@@ -12,6 +12,9 @@ The models we use are [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B), [LLa
 
 ### Using Soft link
 
+1. Clone `llm-awq` and `dist-quant` into your NLP folder. 
+
+
 Your `dist-quant` and `llm-awq` must be in the same folder. For instance, when you `ls`, it should show both llm-awq and dist-quant
 
 ```
@@ -37,3 +40,6 @@ total 32
 lrwxr-xr-x@ 1 athul  staff     10 Nov  3 12:45 llm-awq -> ../llm-awq
 -rw-r--r--@ 1 athul  staff    877 Nov  3 12:56 README.md
 ```
+
+
+2. Then go to `dist-quant`. And run `cd llm-awq`. It will go to the `llm-awq` folder. 
