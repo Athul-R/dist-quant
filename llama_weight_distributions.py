@@ -137,45 +137,85 @@ def reservoir_sample_array_stream(stream: Iterable[np.ndarray], k: int, rng: ran
     return reservoir
 
 
+
 def make_hist_and_qq(layer_idx: int, sample: np.ndarray, bins: int, outdir: str):
     """
-    Create a figure with:
-      - Top: Histogram of weights (full width)
-      - Bottom: 3 Q-Q plots (Normal, Laplace, Logistic), side by side
+    Top: histogram of weights.
+    Bottom: single Q–Q plot overlaying Normal, Laplace, Logistic theoretical quantiles
+            against empirical (standardized) sample quantiles. Includes a legend.
     Saves to outdir/layer_{idx:02d}_weights.png
     """
     if sample.size == 0:
         print(f"[Layer {layer_idx}] No weights found; skipping.")
         return
 
-    # 2 rows x 3 columns; top row spans all 3 columns
-    fig = plt.figure(figsize=(16, 10))
-    gs = fig.add_gridspec(2, 3, height_ratios=[1.2, 1.0])
+    # --- Prepare empirical standardized quantiles ---
+    x = np.sort(sample.astype(np.float64))
+    mu = np.mean(x)
+    sigma = np.std(x, ddof=1)
+    if sigma == 0 or not np.isfinite(sigma):
+        print(f"[Layer {layer_idx}] Degenerate variance; skipping QQ.", file=sys.stderr)
+        return
 
-    # Histogram across the entire top row
-    ax_hist = fig.add_subplot(gs[0, :])
+    z = (x - mu) / sigma  # empirical z-quantiles
+    n = z.size
+    # Use plotting positions (i - 0.5)/n for stability
+    p = (np.arange(1, n + 1) - 0.5) / n
+
+    # --- Theoretical quantiles with unit variance ---
+    # Normal: std=1 already
+    q_norm = stats.norm.ppf(p, loc=0, scale=1.0)
+    # Laplace with unit variance -> scale = 1/sqrt(2)
+    q_lap  = stats.laplace.ppf(p, loc=0, scale=1.0 / np.sqrt(2.0))
+    # Logistic with unit variance -> scale = sqrt(3)/pi
+    q_log  = stats.logistic.ppf(p, loc=0, scale=np.sqrt(3.0) / np.pi)
+
+    # --- Figure layout: 2 rows (hist on top; QQ overlay bottom) ---
+    fig = plt.figure(figsize=(16, 10))
+    gs = fig.add_gridspec(2, 1, height_ratios=[1.1, 1.0])
+
+    # Histogram
+    ax_hist = fig.add_subplot(gs[0, 0])
     ax_hist.hist(sample, bins=bins, density=True)
     ax_hist.set_title(f"Llama Layer {layer_idx}: Weight Value Histogram (n={sample.size:,})")
     ax_hist.set_xlabel("Weight value")
     ax_hist.set_ylabel("Density")
 
-    # Q-Q plots: Normal, Laplace, Logistic in the bottom row
-    dists = [("Normal", "norm"), ("Laplace", "laplace"), ("Logistic", "logistic")]
-    for j, (name, dist_name) in enumerate(dists):
-        ax = fig.add_subplot(gs[1, j])
-        if dist_name == "norm":
-            stats.probplot(sample, dist="norm", plot=ax)
-        else:
-            stats.probplot(sample, dist=getattr(stats, dist_name), plot=ax)
-        ax.set_title(f"Q-Q Plot vs {name}")
+    # Q–Q overlay
+    ax = fig.add_subplot(gs[1, 0])
 
-    # Layout + save
+    # Reference 45° line: y = x
+    # Choose symmetric range that covers all theoretical quantiles
+    q_all = np.concatenate([q_norm, q_lap, q_log])
+    q_min, q_max = np.percentile(q_all, [0.5, 99.5])
+    lim = max(abs(q_min), abs(q_max))
+    ax.plot([-lim, lim], [-lim, lim], linestyle="--", linewidth=1, label="y = x (reference)")
+
+    # Plot empirical vs theoretical for each distribution
+    # (theoretical on x-axis, empirical standardized on y-axis)
+    ax.plot(q_norm, z, linewidth=1.2, alpha=0.9, label="Normal Q–Q")
+    ax.plot(q_lap,  z, linewidth=1.2, alpha=0.9, label="Laplace Q–Q")
+    ax.plot(q_log,  z, linewidth=1.2, alpha=0.9, label="Logistic Q–Q")
+
+    ax.set_xlim(-lim, lim)
+    # Match y-limits to x for fair visual comparison
+    z_min, z_max = np.percentile(z, [0.5, 99.5])
+    lim_y = max(abs(z_min), abs(z_max), lim)
+    ax.set_ylim(-lim_y, lim_y)
+
+    ax.set_title("Q–Q Overlay: Empirical (standardized) vs Theoretical Quantiles")
+    ax.set_xlabel("Theoretical quantile")
+    ax.set_ylabel("Empirical quantile (standardized)")
+    ax.legend(loc="best", frameon=True)
+
     fig.tight_layout()
     os.makedirs(outdir, exist_ok=True)
     outfile = os.path.join(outdir, f"layer_{layer_idx:02d}_weights.png")
     fig.savefig(outfile, dpi=150)
     plt.close(fig)
     print(f"[Layer {layer_idx}] Saved {outfile}")
+
+
 
 
 def main():
