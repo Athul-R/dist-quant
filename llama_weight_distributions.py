@@ -6,15 +6,8 @@ Layer-wise weight distribution visualizer for Meta-Llama-3-8B (safetensors via P
 - Uniformly samples up to N weights per layer across keys matching "model.layers.{i}.*".
 - Plots histogram + single Q–Q overlay vs Normal/Laplace/Logistic (unit variance).
 - Computes Quantile RMSE **and** MAE per layer and prints them.
-- At the end, prints mean ± std over layers for each metric and writes a summary file.
-
-Example:
-  python llama_weight_distributions.py \
-    --model_id /path/to/Meta-Llama-3-8B \
-    --local_only \
-    --sample_per_layer 2000000 \
-    --bins 200 \
-    --outdir ./llama3_weight_plots
+- Adds MAE to the legend and shows the **parameter count per layer** in each plot title.
+- Prints mean ± std over layers for RMSE and MAE (for layers that produced samples) and writes a summary file.
 """
 
 import argparse
@@ -105,10 +98,12 @@ def sample_from_tensor_pt(shard_path: str, key: str, num: int, rng: np.random.Ge
 
 
 def sample_layer_uniform_from_shards(shard_paths: List[str], layer_idx: int, k: int,
-                                     rng: np.random.Generator) -> np.ndarray:
+                                     rng: np.random.Generator) -> Tuple[np.ndarray, int]:
     """
     Uniformly sample up to k elements from ALL tensors whose key starts with model.layers.{layer_idx}.
     Proportional allocation with stochastic rounding (effectively uniform overall).
+    Returns:
+        sample (np.ndarray float32), total_params_in_layer (int)
     """
     tensors: List[Tuple[str, str, int]] = []  # (shard_path, key, numel)
     total = 0
@@ -126,7 +121,7 @@ def sample_layer_uniform_from_shards(shard_paths: List[str], layer_idx: int, k: 
                     total += n
 
     if total == 0 or k <= 0:
-        return np.empty((0,), dtype=np.float32)
+        return np.empty((0,), dtype=np.float32), int(total)
 
     k_eff = min(k, total)
 
@@ -155,14 +150,14 @@ def sample_layer_uniform_from_shards(shard_paths: List[str], layer_idx: int, k: 
         samples.append(sample_from_tensor_pt(shard, key, take, rng))
 
     if not samples:
-        return np.empty((0,), dtype=np.float32)
-    return np.concatenate(samples).astype(np.float32, copy=False)
+        return np.empty((0,), dtype=np.float32), int(total)
+    return np.concatenate(samples).astype(np.float32, copy=False), int(total)
 
 
 # ----------------------------
 # Plot + RMSE + MAE
 # ----------------------------
-def make_hist_and_qq(layer_idx: int, sample: np.ndarray, bins: int, outdir: str) -> Tuple[float, float, float, float, float, float]:
+def make_hist_and_qq(layer_idx: int, sample: np.ndarray, bins: int, outdir: str, n_params: int) -> Tuple[float, float, float, float, float, float]:
     """
     Returns:
       (rmse_norm, rmse_lap, rmse_log, mae_norm, mae_lap, mae_log).
@@ -206,7 +201,7 @@ def make_hist_and_qq(layer_idx: int, sample: np.ndarray, bins: int, outdir: str)
           f"RMSE  N={rmse_norm:.4f}  L={rmse_lap:.4f}  G={rmse_log:.4f}  |  "
           f"MAE  N={mae_norm:.4f}  L={mae_lap:.4f}  G={mae_log:.4f}")
 
-    # Determine best (smallest RMSE) — keep legend concise with RMSE
+    # Determine best (smallest RMSE) for title
     rmse_vals = {"Normal": rmse_norm, "Laplace": rmse_lap, "Logistic": rmse_log}
     best_name = min(rmse_vals, key=rmse_vals.get)
     best_rmse = rmse_vals[best_name]
@@ -215,24 +210,30 @@ def make_hist_and_qq(layer_idx: int, sample: np.ndarray, bins: int, outdir: str)
     fig = plt.figure(figsize=(16, 10), constrained_layout=True)
     gs = fig.add_gridspec(2, 1, height_ratios=[1.1, 1.0])
 
+    # Histogram
     ax_hist = fig.add_subplot(gs[0, 0])
     ax_hist.hist(sample, bins=bins, density=True)
     ax_hist.set_title(
-        f"Llama Layer {layer_idx}: Weight Value Histogram (n={sample.size:,}) • "
-        f"Best fit (RMSE): {best_name} ({best_rmse:.4f})"
+        f"Llama Layer {layer_idx} • Params={n_params:,} • Sample n={sample.size:,} • "
+        f"Best (RMSE): {best_name} ({best_rmse:.4f})"
     )
     ax_hist.set_xlabel("Weight value")
     ax_hist.set_ylabel("Density")
 
+    # Q–Q overlay
     ax = fig.add_subplot(gs[1, 0])
     q_all = np.concatenate([q_norm, q_lap, q_log])
     q_min, q_max = np.percentile(q_all, [0.5, 99.5])
     lim = float(max(abs(q_min), abs(q_max)))
     ax.plot([-lim, lim], [-lim, lim], linestyle="--", linewidth=1, label="y = x (reference)")
 
-    ax.plot(q_norm, z, linewidth=1.2, alpha=0.9, label=f"Normal Q–Q (RMSE={rmse_norm:.4f})")
-    ax.plot(q_lap,  z, linewidth=1.2, alpha=0.9, label=f"Laplace Q–Q (RMSE={rmse_lap:.4f})")
-    ax.plot(q_log,  z, linewidth=1.2, alpha=0.9, label=f"Logistic Q–Q (RMSE={rmse_log:.4f})")
+    # Legend now contains RMSE **and** MAE
+    ax.plot(q_norm, z, linewidth=1.2, alpha=0.9,
+            label=f"Normal Q–Q (RMSE={rmse_norm:.4f}, MAE={mae_norm:.4f})")
+    ax.plot(q_lap,  z, linewidth=1.2, alpha=0.9,
+            label=f"Laplace Q–Q (RMSE={rmse_lap:.4f}, MAE={mae_lap:.4f})")
+    ax.plot(q_log,  z, linewidth=1.2, alpha=0.9,
+            label=f"Logistic Q–Q (RMSE={rmse_log:.4f}, MAE={mae_log:.4f})")
 
     ax.set_xlim(-lim, lim)
     z_min, z_max = np.percentile(z, [0.5, 99.5])
@@ -283,11 +284,11 @@ def main():
     counted_layers = 0
 
     for i in tqdm(range(num_layers), desc="Processing layers"):
-        sample = sample_layer_uniform_from_shards(shard_paths, i, args.sample_per_layer, rng)
-        if sample.size == 0:
+        sample, n_params = sample_layer_uniform_from_shards(shard_paths, i, args.sample_per_layer, rng)
+        if sample.size == 0 or n_params == 0:
             print(f"[Layer {i}] No weights found in shards; skipping.")
             continue
-        rn, rl, rlg, an, al, alg = make_hist_and_qq(i, sample, args.bins, args.outdir)
+        rn, rl, rlg, an, al, alg = make_hist_and_qq(i, sample, args.bins, args.outdir, n_params)
         if all(np.isfinite(v) for v in (rn, rl, rlg, an, al, alg)):
             rmse_norm_all.append(rn); rmse_lap_all.append(rl); rmse_log_all.append(rlg)
             mae_norm_all.append(an);  mae_lap_all.append(al);  mae_log_all.append(alg)
