@@ -1,206 +1,220 @@
 #!/usr/bin/env python3
 """
-Layer-wise weight distribution visualizer for Meta-Llama-3-8B.
+Layer-wise weight distribution visualizer for Meta-Llama-3-8B (safetensors via PyTorch; no model load).
 
-For each transformer block (model.model.layers[i]), this script:
-  1) Reservoir-samples up to N weights across all submodules in the layer
-  2) Plots a histogram of sampled weights
-  3) Plots Q-Q comparisons against Normal, Laplace, and Logistic distributions
-  4) Saves one PNG per layer
-
-Usage (CPU/GPU auto offload):
-  python llama_weight_distributions.py \
-    --model_id meta-llama/Meta-Llama-3-8B \
-    --sample_per_layer 2000000 \
-    --bins 200 \
-    --dtype bfloat16 \
-    --device_map auto \
-    --outdir ./llama3_weight_plots
-
-If you lack GPU memory, prefer --device_map cpu and reduce --sample_per_layer.
+- Reads *.safetensors shards directly (avoids accelerate/meta tensor issues).
+- Uniformly samples up to N weights per layer across keys matching "model.layers.{i}.*".
+- Plots histogram + single Q–Q overlay vs Normal/Laplace/Logistic (unit variance).
+- Computes Quantile RMSE per layer and prints it.
+- At the end, prints mean ± std over layers for each RMSE metric (based on layers that produced samples).
 """
 
 import argparse
 import math
 import os
-import random
 import sys
-from typing import Iterable, Tuple
+from typing import List, Tuple
 
-import torch
-from transformers import AutoConfig, AutoModelForCausalLM
 import numpy as np
 from scipy import stats
+from tqdm import tqdm
+
+import torch
+from safetensors import safe_open
+try:
+    from huggingface_hub import snapshot_download
+except Exception:
+    snapshot_download = None
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from tqdm import tqdm
 
 
+# ----------------------------
+# Args
+# ----------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Layer-wise weight histograms and QQ plots for Llama.")
-    p.add_argument("--model_id", type=str, default="meta-llama/Meta-Llama-3-8B",
-                   help="Hugging Face model id or local path.")
-    p.add_argument("--revision", type=str, default=None, help="Optional HF revision/commit/tag.")
-    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"],
-                   help="Torch dtype to load the model weights.")
-    p.add_argument("--device_map", type=str, default="auto", choices=["auto", "cpu"],
-                   help="accelerate-style device map. 'auto' to shard to GPU/CPU if available, 'cpu' to force CPU.")
+    p = argparse.ArgumentParser(description="Layer-wise weight histograms and QQ overlays (no model load).")
+    p.add_argument("--model_id", type=str, required=True,
+                   help="Local path to folder with *.safetensors (or HF repo id if not using --local_only).")
+    p.add_argument("--revision", type=str, default=None, help="Optional HF revision/commit/tag (if not --local_only).")
+    p.add_argument("--local_only", action="store_true",
+                   help="Do not download; treat --model_id as a local directory with safetensors.")
     p.add_argument("--sample_per_layer", type=int, default=2_000_000,
-                   help="Max number of weights to sample per layer (reservoir sampling).")
+                   help="Max number of weights to sample per layer (uniform without replacement).")
     p.add_argument("--bins", type=int, default=200, help="Histogram bins.")
-    p.add_argument("--seed", type=int, default=123, help="Random seed for reproducibility.")
-    p.add_argument("--outdir", type=str, default="./llama_weight_plots",
+    p.add_argument("--seed", type=int, default=123, help="Random seed.")
+    p.add_argument("--outdir", type=str, default="./llama3_weight_plots",
                    help="Output directory for PNGs.")
     return p.parse_args()
 
 
-def torch_dtype_from_str(s: str) -> torch.dtype:
-    if s == "float16":
-        return torch.float16
-    if s == "bfloat16":
-        return torch.bfloat16
-    if s == "float32":
-        return torch.float32
-    raise ValueError(f"Unsupported dtype: {s}")
+# ----------------------------
+# Utils
+# ----------------------------
+def find_snapshot_path(model_id: str, revision: str | None, local_only: bool) -> str:
+    if local_only:
+        if not os.path.isdir(model_id):
+            print(f"ERROR: --local_only specified, but path not found: {model_id}", file=sys.stderr)
+            sys.exit(1)
+        return os.path.abspath(model_id)
+    if snapshot_download is None:
+        print("ERROR: huggingface_hub not installed; use --local_only or install it.", file=sys.stderr)
+        sys.exit(1)
+    return snapshot_download(repo_id=model_id, revision=revision, allow_patterns=["*.safetensors"])
 
 
-def iter_param_chunks_1d(layer: torch.nn.Module) -> Iterable[np.ndarray]:
+def list_safetensors(root: str) -> List[str]:
+    out = [os.path.join(root, fn) for fn in os.listdir(root) if fn.endswith(".safetensors")]
+    if not out:
+        print(f"ERROR: No *.safetensors found under {root}", file=sys.stderr)
+        sys.exit(1)
+    return sorted(out)
+
+
+# ----------------------------
+# Sampling from shards (PyTorch backend)
+# ----------------------------
+def sample_from_tensor_pt(shard_path: str, key: str, num: int, rng: np.random.Generator) -> np.ndarray:
     """
-    Yield flattened weight arrays (numpy) for each parameter tensor in the layer.
-    Biases are included (they're informative and small).
-    Grad is disabled; we only read .data.
+    Uniformly sample 'num' elements from the tensor at (shard_path, key) using PyTorch backend.
+    Returns float32 numpy array on CPU. Only the sampled slice is materialized.
     """
-    with torch.no_grad():
-        for _, p in layer.named_parameters(recurse=True):
-            # Skip empty or None
-            if p is None or p.numel() == 0:
-                continue
-            # Some params may be on GPU due to device_map=auto; move chunk-wise to CPU as numpy
-            # NOTE: .float() for consistent QQ against continuous distributions
-            arr = p.detach().to("cpu").float().view(-1).numpy()
-            if arr.size == 0:
-                continue
-            yield arr
+    with safe_open(shard_path, framework="pt") as f:
+        t: torch.Tensor = f.get_tensor(key)  # CPU tensor (bf16/fp16/fp32)
+        flat = t.view(-1)
+        n = flat.numel()
+        if n == 0 or num <= 0:
+            return np.empty((0,), dtype=np.float32)
+        take = min(n, num)
+        if take == n:
+            return flat.to(dtype=torch.float32).cpu().numpy()
+        idx_np = rng.choice(n, size=take, replace=False)
+        idx = torch.from_numpy(idx_np).to(dtype=torch.long)  # CPU
+        gathered = torch.index_select(flat, 0, idx).to(dtype=torch.float32)
+        return gathered.cpu().numpy()
 
 
-def reservoir_sample_array_stream(stream: Iterable[np.ndarray], k: int, rng: random.Random) -> np.ndarray:
+def sample_layer_uniform_from_shards(shard_paths: List[str], layer_idx: int, k: int,
+                                     rng: np.random.Generator) -> np.ndarray:
     """
-    Reservoir-sample exactly up to k elements from a stream of 1D numpy arrays
-    without holding the entire stream in memory.
+    Uniformly sample up to k elements from ALL tensors whose key starts with model.layers.{layer_idx}.
+    Proportional allocation with stochastic rounding (effectively uniform overall).
+    """
+    tensors: List[Tuple[str, str, int]] = []  # (shard_path, key, numel)
+    total = 0
 
-    Returns a 1D numpy array with size <= k.
-    """
-    if k <= 0:
+    # Discover tensors & sizes
+    for shard in shard_paths:
+        with safe_open(shard, framework="pt") as f:
+            for kname in f.keys():
+                if not kname.startswith(f"model.layers.{layer_idx}."):
+                    continue
+                t = f.get_tensor(kname)  # view
+                n = t.numel()
+                if n > 0:
+                    tensors.append((shard, kname, n))
+                    total += n
+
+    if total == 0 or k <= 0:
         return np.empty((0,), dtype=np.float32)
 
-    # Initialize reservoir
-    reservoir = None
-    filled = 0
-    seen = 0
+    k_eff = min(k, total)
 
-    for chunk in stream:
-        # If still filling the reservoir
-        if reservoir is None:
-            if chunk.size >= k:
-                # Take the first k and then handle the rest of the chunk via standard reservoir logic
-                reservoir = np.array(chunk[:k], dtype=np.float32, copy=True)
-                filled = k
-                seen = k
-                remainder = chunk[k:]
-                # Now process the remainder with reservoir updates
-                for val in remainder:
-                    seen += 1
-                    j = rng.randint(1, seen)
-                    if j <= k:
-                        reservoir[j - 1] = val
-            else:
-                # Take all; might need to expand later
-                reservoir = np.array(chunk, dtype=np.float32, copy=True)
-                filled = chunk.size
-                seen = chunk.size
-        else:
-            # We already have a reservoir
-            for val in chunk:
-                seen += 1
-                if filled < k:
-                    # Still space to fill
-                    reservoir = np.append(reservoir, np.float32(val))
-                    filled += 1
-                else:
-                    j = rng.randint(1, seen)
-                    if j <= k:
-                        reservoir[j - 1] = val
+    # Proportional allocation with stochastic rounding
+    shares = [(shard, key, n, (n / total) * k_eff) for (shard, key, n) in tensors]
+    floor_parts = [(shard, key, n, int(math.floor(exp))) for (shard, key, n, exp) in shares]
+    taken = sum(fp[3] for fp in floor_parts)
+    remainder = k_eff - taken
 
-    if reservoir is None:
+    bump = set()
+    if remainder > 0:
+        fracs = sorted(
+            [(exp - math.floor(exp), shard, key, n) for (shard, key, n, exp) in shares],
+            key=lambda x: x[0],
+            reverse=True
+        )
+        for i in range(remainder):
+            _, shard, key, _ = fracs[i]
+            bump.add((shard, key))
+
+    samples = []
+    for (shard, key, n, base_take) in floor_parts:
+        take = base_take + (1 if (shard, key) in bump else 0)
+        if take <= 0:
+            continue
+        samples.append(sample_from_tensor_pt(shard, key, take, rng))
+
+    if not samples:
         return np.empty((0,), dtype=np.float32)
-    return reservoir
+    return np.concatenate(samples).astype(np.float32, copy=False)
 
 
-
-def make_hist_and_qq(layer_idx: int, sample: np.ndarray, bins: int, outdir: str):
+# ----------------------------
+# Plot + RMSE
+# ----------------------------
+def make_hist_and_qq(layer_idx: int, sample: np.ndarray, bins: int, outdir: str) -> Tuple[float, float, float]:
     """
-    Top: histogram of weights.
-    Bottom: single Q–Q plot overlaying Normal, Laplace, Logistic theoretical quantiles
-            against empirical (standardized) sample quantiles. Includes a legend.
-    Saves to outdir/layer_{idx:02d}_weights.png
+    Returns (rmse_norm, rmse_lap, rmse_log). If no sample, returns (np.nan, np.nan, np.nan).
     """
     if sample.size == 0:
         print(f"[Layer {layer_idx}] No weights found; skipping.")
-        return
+        return (np.nan, np.nan, np.nan)
 
-    # --- Prepare empirical standardized quantiles ---
     x = np.sort(sample.astype(np.float64))
     mu = np.mean(x)
     sigma = np.std(x, ddof=1)
-    if sigma == 0 or not np.isfinite(sigma):
-        print(f"[Layer {layer_idx}] Degenerate variance; skipping QQ.", file=sys.stderr)
-        return
+    if not np.isfinite(sigma) or sigma == 0:
+        print(f"[Layer {layer_idx}] Degenerate variance; skipping.", file=sys.stderr)
+        return (np.nan, np.nan, np.nan)
 
-    z = (x - mu) / sigma  # empirical z-quantiles
+    z = (x - mu) / sigma
     n = z.size
-    # Use plotting positions (i - 0.5)/n for stability
     p = (np.arange(1, n + 1) - 0.5) / n
 
-    # --- Theoretical quantiles with unit variance ---
-    # Normal: std=1 already
+    # Unit-variance theoretical quantiles
     q_norm = stats.norm.ppf(p, loc=0, scale=1.0)
-    # Laplace with unit variance -> scale = 1/sqrt(2)
     q_lap  = stats.laplace.ppf(p, loc=0, scale=1.0 / np.sqrt(2.0))
-    # Logistic with unit variance -> scale = sqrt(3)/pi
     q_log  = stats.logistic.ppf(p, loc=0, scale=np.sqrt(3.0) / np.pi)
 
-    # --- Figure layout: 2 rows (hist on top; QQ overlay bottom) ---
-    fig = plt.figure(figsize=(16, 10))
+    # RMSE (quantile-space)
+    rmse_norm = float(np.sqrt(np.mean((z - q_norm) ** 2)))
+    rmse_lap  = float(np.sqrt(np.mean((z - q_lap) ** 2)))
+    rmse_log  = float(np.sqrt(np.mean((z - q_log) ** 2)))
+
+    print(f"[Layer {layer_idx:02d}] RMSE  Normal = {rmse_norm:.4f} | Laplace = {rmse_lap:.4f} | Logistic = {rmse_log:.4f}")
+
+    rmse_vals = {"Normal": rmse_norm, "Laplace": rmse_lap, "Logistic": rmse_log}
+    best_name = min(rmse_vals, key=rmse_vals.get)
+    best_rmse = rmse_vals[best_name]
+
+    # Figure
+    fig = plt.figure(figsize=(16, 10), constrained_layout=True)
     gs = fig.add_gridspec(2, 1, height_ratios=[1.1, 1.0])
 
-    # Histogram
     ax_hist = fig.add_subplot(gs[0, 0])
     ax_hist.hist(sample, bins=bins, density=True)
-    ax_hist.set_title(f"Llama Layer {layer_idx}: Weight Value Histogram (n={sample.size:,})")
+    ax_hist.set_title(
+        f"Llama Layer {layer_idx}: Weight Value Histogram (n={sample.size:,}) • "
+        f"Best fit by RMSE: {best_name} ({best_rmse:.4f})"
+    )
     ax_hist.set_xlabel("Weight value")
     ax_hist.set_ylabel("Density")
 
-    # Q–Q overlay
     ax = fig.add_subplot(gs[1, 0])
-
-    # Reference 45° line: y = x
-    # Choose symmetric range that covers all theoretical quantiles
     q_all = np.concatenate([q_norm, q_lap, q_log])
     q_min, q_max = np.percentile(q_all, [0.5, 99.5])
-    lim = max(abs(q_min), abs(q_max))
+    lim = float(max(abs(q_min), abs(q_max)))
     ax.plot([-lim, lim], [-lim, lim], linestyle="--", linewidth=1, label="y = x (reference)")
 
-    # Plot empirical vs theoretical for each distribution
-    # (theoretical on x-axis, empirical standardized on y-axis)
-    ax.plot(q_norm, z, linewidth=1.2, alpha=0.9, label="Normal Q–Q")
-    ax.plot(q_lap,  z, linewidth=1.2, alpha=0.9, label="Laplace Q–Q")
-    ax.plot(q_log,  z, linewidth=1.2, alpha=0.9, label="Logistic Q–Q")
+    ax.plot(q_norm, z, linewidth=1.2, alpha=0.9, label=f"Normal Q–Q (RMSE={rmse_norm:.4f})")
+    ax.plot(q_lap,  z, linewidth=1.2, alpha=0.9, label=f"Laplace Q–Q (RMSE={rmse_lap:.4f})")
+    ax.plot(q_log,  z, linewidth=1.2, alpha=0.9, label=f"Logistic Q–Q (RMSE={rmse_log:.4f})")
 
     ax.set_xlim(-lim, lim)
-    # Match y-limits to x for fair visual comparison
     z_min, z_max = np.percentile(z, [0.5, 99.5])
-    lim_y = max(abs(z_min), abs(z_max), lim)
+    lim_y = float(max(abs(z_min), abs(z_max), lim))
     ax.set_ylim(-lim_y, lim_y)
 
     ax.set_title("Q–Q Overlay: Empirical (standardized) vs Theoretical Quantiles")
@@ -208,59 +222,82 @@ def make_hist_and_qq(layer_idx: int, sample: np.ndarray, bins: int, outdir: str)
     ax.set_ylabel("Empirical quantile (standardized)")
     ax.legend(loc="best", frameon=True)
 
-    fig.tight_layout()
     os.makedirs(outdir, exist_ok=True)
     outfile = os.path.join(outdir, f"layer_{layer_idx:02d}_weights.png")
     fig.savefig(outfile, dpi=150)
     plt.close(fig)
     print(f"[Layer {layer_idx}] Saved {outfile}")
 
+    return (rmse_norm, rmse_lap, rmse_log)
 
 
-
+# ----------------------------
+# Main
+# ----------------------------
 def main():
     args = parse_args()
-    rng = random.Random(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    rng = np.random.default_rng(args.seed)
 
-    dtype = torch_dtype_from_str(args.dtype)
+    snapshot_path = find_snapshot_path(args.model_id, args.revision, local_only=args.local_only)
+    shard_paths = list_safetensors(snapshot_path)
+    print(f"Using {len(shard_paths)} safetensors shard(s) from: {snapshot_path}")
 
-    print(f"Loading config: {args.model_id}")
-    config = AutoConfig.from_pretrained(args.model_id, revision=args.revision, trust_remote_code=True)
-    # Avoids caching KV by default to lower peak memory when we don't need generation
-    try:
-        config.use_cache = False
-    except Exception:
-        pass
+    # Infer #layers
+    max_layer = -1
+    for sp in shard_paths:
+        with safe_open(sp, framework="pt") as f:
+            for k in f.keys():
+                if k.startswith("model.layers."):
+                    parts = k.split(".")
+                    if len(parts) > 2 and parts[2].isdigit():
+                        idx = int(parts[2])
+                        if idx > max_layer:
+                            max_layer = idx
+    num_layers = (max_layer + 1) if max_layer >= 0 else 32
+    print(f"Found {num_layers} transformer layers (by scanning shard keys).")
 
-    print(f"Loading model weights (dtype={dtype}, device_map={args.device_map})...")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        revision=args.revision,
-        config=config,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-        device_map=(None if args.device_map == "cpu" else "auto"),
-        trust_remote_code=True,
-    )
-    model.eval()
-    torch.set_grad_enabled(False)
+    rmse_norm_all, rmse_lap_all, rmse_log_all = [], [], []
+    counted_layers = 0
 
-    # Grab transformer layers (Llama-style)
-    # Expected: model.model.layers is a ModuleList
-    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
-        print("ERROR: Unexpected model structure. Expected model.model.layers to exist.", file=sys.stderr)
-        sys.exit(1)
+    for i in tqdm(range(num_layers), desc="Processing layers"):
+        sample = sample_layer_uniform_from_shards(shard_paths, i, args.sample_per_layer, rng)
+        if sample.size == 0:
+            print(f"[Layer {i}] No weights found in shards; skipping.")
+            continue
+        rn, rl, rlg = make_hist_and_qq(i, sample, args.bins, args.outdir)
+        # Only count if valid (not NaN)
+        if np.isfinite(rn) and np.isfinite(rl) and np.isfinite(rlg):
+            rmse_norm_all.append(rn)
+            rmse_lap_all.append(rl)
+            rmse_log_all.append(rlg)
+            counted_layers += 1
 
-    num_layers = len(model.model.layers)
-    print(f"Found {num_layers} transformer layers.")
+    # ---- Summary stats over layers ----
+    def mean_std(arr):
+        arr = np.asarray(arr, dtype=np.float64)
+        return float(np.mean(arr)), float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
 
-    for i, layer in enumerate(tqdm(model.model.layers, total=num_layers, desc="Processing layers")):
-        # Stream all params in this layer and reservoir-sample up to sample_per_layer values
-        stream = iter_param_chunks_1d(layer)
-        sample = reservoir_sample_array_stream(stream, args.sample_per_layer, rng)
-        make_hist_and_qq(i, sample, args.bins, args.outdir)
+    if counted_layers == 0:
+        print("No layers produced valid samples; no summary metrics.")
+    else:
+        mN, sN = mean_std(rmse_norm_all)
+        mL, sL = mean_std(rmse_lap_all)
+        mG, sG = mean_std(rmse_log_all)
+        print("\n==== Quantile RMSE summary over layers ====")
+        print(f"Layers counted: {counted_layers}/{num_layers}")
+        print(f"Normal  : mean={mN:.6f}, std={sN:.6f}")
+        print(f"Laplace : mean={mL:.6f}, std={sL:.6f}")
+        print(f"Logistic: mean={mG:.6f}, std={sG:.6f}")
+
+        # Also write a small summary file next to the plots
+        os.makedirs(args.outdir, exist_ok=True)
+        summary_path = os.path.join(args.outdir, "rmse_summary.txt")
+        with open(summary_path, "w") as fh:
+            fh.write(f"Layers counted: {counted_layers}/{num_layers}\n")
+            fh.write(f"Normal  : mean={mN:.6f}, std={sN:.6f}\n")
+            fh.write(f"Laplace : mean={mL:.6f}, std={sL:.6f}\n")
+            fh.write(f"Logistic: mean={mG:.6f}, std={sG:.6f}\n")
+        print(f"Summary written to {summary_path}")
 
     print("Done.")
 
