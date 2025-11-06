@@ -5,8 +5,16 @@ Layer-wise weight distribution visualizer for Meta-Llama-3-8B (safetensors via P
 - Reads *.safetensors shards directly (avoids accelerate/meta tensor issues).
 - Uniformly samples up to N weights per layer across keys matching "model.layers.{i}.*".
 - Plots histogram + single Q–Q overlay vs Normal/Laplace/Logistic (unit variance).
-- Computes Quantile RMSE per layer and prints it.
-- At the end, prints mean ± std over layers for each RMSE metric (based on layers that produced samples).
+- Computes Quantile RMSE **and** MAE per layer and prints them.
+- At the end, prints mean ± std over layers for each metric and writes a summary file.
+
+Example:
+  python llama_weight_distributions.py \
+    --model_id /path/to/Meta-Llama-3-8B \
+    --local_only \
+    --sample_per_layer 2000000 \
+    --bins 200 \
+    --outdir ./llama3_weight_plots
 """
 
 import argparse
@@ -152,22 +160,24 @@ def sample_layer_uniform_from_shards(shard_paths: List[str], layer_idx: int, k: 
 
 
 # ----------------------------
-# Plot + RMSE
+# Plot + RMSE + MAE
 # ----------------------------
-def make_hist_and_qq(layer_idx: int, sample: np.ndarray, bins: int, outdir: str) -> Tuple[float, float, float]:
+def make_hist_and_qq(layer_idx: int, sample: np.ndarray, bins: int, outdir: str) -> Tuple[float, float, float, float, float, float]:
     """
-    Returns (rmse_norm, rmse_lap, rmse_log). If no sample, returns (np.nan, np.nan, np.nan).
+    Returns:
+      (rmse_norm, rmse_lap, rmse_log, mae_norm, mae_lap, mae_log).
+    If no valid sample, returns (nan, nan, nan, nan, nan, nan).
     """
     if sample.size == 0:
         print(f"[Layer {layer_idx}] No weights found; skipping.")
-        return (np.nan, np.nan, np.nan)
+        return (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan)
 
     x = np.sort(sample.astype(np.float64))
     mu = np.mean(x)
     sigma = np.std(x, ddof=1)
     if not np.isfinite(sigma) or sigma == 0:
         print(f"[Layer {layer_idx}] Degenerate variance; skipping.", file=sys.stderr)
-        return (np.nan, np.nan, np.nan)
+        return (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan)
 
     z = (x - mu) / sigma
     n = z.size
@@ -178,13 +188,25 @@ def make_hist_and_qq(layer_idx: int, sample: np.ndarray, bins: int, outdir: str)
     q_lap  = stats.laplace.ppf(p, loc=0, scale=1.0 / np.sqrt(2.0))
     q_log  = stats.logistic.ppf(p, loc=0, scale=np.sqrt(3.0) / np.pi)
 
-    # RMSE (quantile-space)
-    rmse_norm = float(np.sqrt(np.mean((z - q_norm) ** 2)))
-    rmse_lap  = float(np.sqrt(np.mean((z - q_lap) ** 2)))
-    rmse_log  = float(np.sqrt(np.mean((z - q_log) ** 2)))
+    # Errors in quantile space
+    eN = z - q_norm
+    eL = z - q_lap
+    eG = z - q_log
 
-    print(f"[Layer {layer_idx:02d}] RMSE  Normal = {rmse_norm:.4f} | Laplace = {rmse_lap:.4f} | Logistic = {rmse_log:.4f}")
+    # RMSE
+    rmse_norm = float(np.sqrt(np.mean(eN ** 2)))
+    rmse_lap  = float(np.sqrt(np.mean(eL ** 2)))
+    rmse_log  = float(np.sqrt(np.mean(eG ** 2)))
+    # MAE
+    mae_norm = float(np.mean(np.abs(eN)))
+    mae_lap  = float(np.mean(np.abs(eL)))
+    mae_log  = float(np.mean(np.abs(eG)))
 
+    print(f"[Layer {layer_idx:02d}] "
+          f"RMSE  N={rmse_norm:.4f}  L={rmse_lap:.4f}  G={rmse_log:.4f}  |  "
+          f"MAE  N={mae_norm:.4f}  L={mae_lap:.4f}  G={mae_log:.4f}")
+
+    # Determine best (smallest RMSE) — keep legend concise with RMSE
     rmse_vals = {"Normal": rmse_norm, "Laplace": rmse_lap, "Logistic": rmse_log}
     best_name = min(rmse_vals, key=rmse_vals.get)
     best_rmse = rmse_vals[best_name]
@@ -197,7 +219,7 @@ def make_hist_and_qq(layer_idx: int, sample: np.ndarray, bins: int, outdir: str)
     ax_hist.hist(sample, bins=bins, density=True)
     ax_hist.set_title(
         f"Llama Layer {layer_idx}: Weight Value Histogram (n={sample.size:,}) • "
-        f"Best fit by RMSE: {best_name} ({best_rmse:.4f})"
+        f"Best fit (RMSE): {best_name} ({best_rmse:.4f})"
     )
     ax_hist.set_xlabel("Weight value")
     ax_hist.set_ylabel("Density")
@@ -228,7 +250,7 @@ def make_hist_and_qq(layer_idx: int, sample: np.ndarray, bins: int, outdir: str)
     plt.close(fig)
     print(f"[Layer {layer_idx}] Saved {outfile}")
 
-    return (rmse_norm, rmse_lap, rmse_log)
+    return (rmse_norm, rmse_lap, rmse_log, mae_norm, mae_lap, mae_log)
 
 
 # ----------------------------
@@ -257,6 +279,7 @@ def main():
     print(f"Found {num_layers} transformer layers (by scanning shard keys).")
 
     rmse_norm_all, rmse_lap_all, rmse_log_all = [], [], []
+    mae_norm_all, mae_lap_all, mae_log_all = [], [], []
     counted_layers = 0
 
     for i in tqdm(range(num_layers), desc="Processing layers"):
@@ -264,18 +287,20 @@ def main():
         if sample.size == 0:
             print(f"[Layer {i}] No weights found in shards; skipping.")
             continue
-        rn, rl, rlg = make_hist_and_qq(i, sample, args.bins, args.outdir)
-        # Only count if valid (not NaN)
-        if np.isfinite(rn) and np.isfinite(rl) and np.isfinite(rlg):
-            rmse_norm_all.append(rn)
-            rmse_lap_all.append(rl)
-            rmse_log_all.append(rlg)
+        rn, rl, rlg, an, al, alg = make_hist_and_qq(i, sample, args.bins, args.outdir)
+        if all(np.isfinite(v) for v in (rn, rl, rlg, an, al, alg)):
+            rmse_norm_all.append(rn); rmse_lap_all.append(rl); rmse_log_all.append(rlg)
+            mae_norm_all.append(an);  mae_lap_all.append(al);  mae_log_all.append(alg)
             counted_layers += 1
 
     # ---- Summary stats over layers ----
     def mean_std(arr):
         arr = np.asarray(arr, dtype=np.float64)
-        return float(np.mean(arr)), float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
+        if arr.size == 0:
+            return (float("nan"), float("nan"))
+        if arr.size == 1:
+            return (float(arr[0]), 0.0)
+        return (float(np.mean(arr)), float(np.std(arr, ddof=1)))
 
     if counted_layers == 0:
         print("No layers produced valid samples; no summary metrics.")
@@ -283,21 +308,36 @@ def main():
         mN, sN = mean_std(rmse_norm_all)
         mL, sL = mean_std(rmse_lap_all)
         mG, sG = mean_std(rmse_log_all)
+
+        aN, aNs = mean_std(mae_norm_all)
+        aL, aLs = mean_std(mae_lap_all)
+        aG, aGs = mean_std(mae_log_all)
+
         print("\n==== Quantile RMSE summary over layers ====")
         print(f"Layers counted: {counted_layers}/{num_layers}")
         print(f"Normal  : mean={mN:.6f}, std={sN:.6f}")
         print(f"Laplace : mean={mL:.6f}, std={sL:.6f}")
         print(f"Logistic: mean={mG:.6f}, std={sG:.6f}")
 
-        # Also write a small summary file next to the plots
+        print("\n==== Quantile MAE summary over layers ====")
+        print(f"Normal  : mean={aN:.6f}, std={aNs:.6f}")
+        print(f"Laplace : mean={aL:.6f}, std={aLs:.6f}")
+        print(f"Logistic: mean={aG:.6f}, std={aGs:.6f}")
+
+        # Write a summary file
         os.makedirs(args.outdir, exist_ok=True)
-        summary_path = os.path.join(args.outdir, "rmse_summary.txt")
+        summary_path = os.path.join(args.outdir, "rmse_mae_summary.txt")
         with open(summary_path, "w") as fh:
-            fh.write(f"Layers counted: {counted_layers}/{num_layers}\n")
-            fh.write(f"Normal  : mean={mN:.6f}, std={sN:.6f}\n")
-            fh.write(f"Laplace : mean={mL:.6f}, std={sL:.6f}\n")
-            fh.write(f"Logistic: mean={mG:.6f}, std={sG:.6f}\n")
-        print(f"Summary written to {summary_path}")
+            fh.write(f"Layers counted: {counted_layers}/{num_layers}\n\n")
+            fh.write("RMSE (quantile-space):\n")
+            fh.write(f"  Normal  : mean={mN:.6f}, std={sN:.6f}\n")
+            fh.write(f"  Laplace : mean={mL:.6f}, std={sL:.6f}\n")
+            fh.write(f"  Logistic: mean={mG:.6f}, std={sG:.6f}\n\n")
+            fh.write("MAE (quantile-space):\n")
+            fh.write(f"  Normal  : mean={aN:.6f}, std={aNs:.6f}\n")
+            fh.write(f"  Laplace : mean={aL:.6f}, std={aLs:.6f}\n")
+            fh.write(f"  Logistic: mean={aG:.6f}, std={aGs:.6f}\n")
+        print(f"\nSummary written to {summary_path}")
 
     print("Done.")
 
