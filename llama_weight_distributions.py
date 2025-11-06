@@ -140,38 +140,36 @@ def reservoir_sample_array_stream(stream: Iterable[np.ndarray], k: int, rng: ran
 def make_hist_and_qq(layer_idx: int, sample: np.ndarray, bins: int, outdir: str):
     """
     Create a figure with:
-      - Top: Histogram of weights
-      - Bottom: 3 Q-Q plots (Normal, Laplace, Logistic)
+      - Top: Histogram of weights (full width)
+      - Bottom: 3 Q-Q plots (Normal, Laplace, Logistic), side by side
     Saves to outdir/layer_{idx:02d}_weights.png
     """
     if sample.size == 0:
         print(f"[Layer {layer_idx}] No weights found; skipping.")
         return
 
-    fig = plt.figure(figsize=(14, 12))
-    gs = fig.add_gridspec(2, 2, height_ratios=[1.2, 1.0])
+    # 2 rows x 3 columns; top row spans all 3 columns
+    fig = plt.figure(figsize=(16, 10))
+    gs = fig.add_gridspec(2, 3, height_ratios=[1.2, 1.0])
 
-    # Histogram (full width top row)
+    # Histogram across the entire top row
     ax_hist = fig.add_subplot(gs[0, :])
     ax_hist.hist(sample, bins=bins, density=True)
     ax_hist.set_title(f"Llama Layer {layer_idx}: Weight Value Histogram (n={sample.size:,})")
     ax_hist.set_xlabel("Weight value")
     ax_hist.set_ylabel("Density")
 
-    # Q-Q plots bottom row: Normal, Laplace, Logistic
-    dists = [("Normal", "norm", None),
-             ("Laplace", "laplace", None),
-             ("Logistic", "logistic", None)]
-
-    for j, (name, dist_name, sparams) in enumerate(dists):
-        ax = fig.add_subplot(gs[1, j % 2])
+    # Q-Q plots: Normal, Laplace, Logistic in the bottom row
+    dists = [("Normal", "norm"), ("Laplace", "laplace"), ("Logistic", "logistic")]
+    for j, (name, dist_name) in enumerate(dists):
+        ax = fig.add_subplot(gs[1, j])
         if dist_name == "norm":
             stats.probplot(sample, dist="norm", plot=ax)
         else:
-            # For Laplace/Logistic, pass the scipy.stats frozen distribution
             stats.probplot(sample, dist=getattr(stats, dist_name), plot=ax)
         ax.set_title(f"Q-Q Plot vs {name}")
 
+    # Layout + save
     fig.tight_layout()
     os.makedirs(outdir, exist_ok=True)
     outfile = os.path.join(outdir, f"layer_{layer_idx:02d}_weights.png")
