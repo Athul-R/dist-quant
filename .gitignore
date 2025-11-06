@@ -171,3 +171,13 @@ cython_debug/
 **/*.pyc
 *.json
 __pycache__
+Meta-Llama-3-8B/
+quant_cache/
+awq_cache/
+llama3_weight_plots/
+figures/
+examples/
+scripts/
+tinychat/
+
+
