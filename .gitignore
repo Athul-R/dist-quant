@@ -171,3 +171,11 @@ cython_debug/
 **/*.pyc
 *.json
 __pycache__
+
+# model folders
+Meta-Llama-3-8B/
+awq_cache/
+quant_cache/
+examples/
+figures/
+tinychat/
