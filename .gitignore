@@ -178,5 +178,8 @@ figures/
 examples/
 scripts/
 tinychat/
+llama3_weight_plots/
+qwen_weight_plots/
+Qwen2.5-7B/
 
 

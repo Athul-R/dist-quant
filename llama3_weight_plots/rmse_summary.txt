@@ -1,4 +1,0 @@
-Layers counted: 32/32
-Normal  : mean=0.217772, std=0.020592
-Laplace : mean=0.190749, std=0.032011
-Logistic: mean=0.175190, std=0.029445
