@@ -46,13 +46,13 @@ def ensure_output_dir(path: str | Path) -> Path:
     return out_dir
 
 
-def extract_scale_weight_products(
+def extract_normalized_awq_weights(
     model,
     awq_results: Dict,
     output_dir: str | Path,
-    save_weights: bool = False,
-) -> Iterable[Tuple[str, Path, Path, Path]]:
-    """Extract scales, weights, and scale-weight products for each linear layer.
+    bit_width: int,
+) -> Iterable[Tuple[str, Path]]:
+    """Extract normalized AWQ-scaled weights for each linear layer.
 
     Parameters
     ----------
@@ -61,19 +61,20 @@ def extract_scale_weight_products(
     awq_results:
         Object returned by ``torch.load`` on an AWQ cache file.
     output_dir:
-        Folder where ``*.pth`` files will be written.
-    save_weights:
-        If ``True``, also writes the raw weight matrix for each layer.
+        Folder where ``*.npy`` files will be written.
+    bit_width:
+        Quantization bit width used to compute the step size.
 
     Yields
     ------
     tuple
-        ``(layer_name, scale_path, weight_path, scale_weight_path)`` for each processed layer.
+        ``(layer_name, normalized_weight_path)`` for each processed layer.
     """
 
     linears = get_named_linears(model)
     scales = awq_results.get("scale", [])
     out_dir = ensure_output_dir(output_dir)
+    denom = (2 ** (bit_width - 1)) - 1
 
     for block_name, scale_names, scale_tensor in scales:
         if scale_tensor.ndim == 0:
@@ -93,20 +94,16 @@ def extract_scale_weight_products(
                 continue
 
             scale_weight_product = weight_matrix * scale_vector.reshape(1, -1)
+            max_abs = np.max(np.abs(scale_weight_product), axis=0)
+            step_sizes = max_abs / denom
+            step_sizes[step_sizes == 0] = 1.0
+            normalized_weights = scale_weight_product / step_sizes.reshape(1, -1)
 
             layer_prefix = out_dir / sanitize_name(scale_name)
-            scale_path = layer_prefix.with_name(layer_prefix.name + "_scale.npy")
-            scale_weight_path = layer_prefix.with_name(layer_prefix.name + "_scale_weight.npy")
-            weight_path = (
-                layer_prefix.with_name(layer_prefix.name + "_weight.npy") if save_weights else None
-            )
+            normalized_path = layer_prefix.with_name(layer_prefix.name + "_normalized.npy")
+            np.save(normalized_path, normalized_weights)
 
-            np.save(scale_path, scale_vector)
-            np.save(scale_weight_path, scale_weight_product)
-            if save_weights and weight_path is not None:
-                np.save(weight_path, weight_matrix)
-
-            yield scale_name, scale_path, weight_path, scale_weight_path
+            yield scale_name, normalized_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -119,11 +116,6 @@ def parse_args() -> argparse.Namespace:
         help="Directory where extracted tensors will be written (default: awq_extracted).",
     )
     parser.add_argument(
-        "--save-weights",
-        action="store_true",
-        help="Also store the raw weight matrices (can be large).",
-    )
-    parser.add_argument(
         "--torch-dtype",
         default="float16",
         help="Torch dtype string for loading the model (default: float16).",
@@ -132,6 +124,12 @@ def parse_args() -> argparse.Namespace:
         "--device-map",
         default="auto",
         help="Device map passed to transformers for model loading (default: auto).",
+    )
+    parser.add_argument(
+        "--bit-width",
+        type=int,
+        default=4,
+        help="Bit width of the signed quantizer used for AWQ (default: 4).",
     )
     return parser.parse_args()
 
@@ -142,15 +140,13 @@ def main():
     awq_results = load_awq_cache(args.awq_cache)
 
     summary = []
-    for layer_name, scale_path, weight_path, scale_weight_path in extract_scale_weight_products(
-        model, awq_results, args.output_dir, save_weights=args.save_weights
+    for layer_name, normalized_path in extract_normalized_awq_weights(
+        model, awq_results, args.output_dir, bit_width=args.bit_width
     ):
         summary.append(
             {
                 "layer": layer_name,
-                "scale": str(scale_path),
-                "weight": str(weight_path) if weight_path else None,
-                "scale_weight": str(scale_weight_path),
+                "normalized": str(normalized_path),
             }
         )
 
