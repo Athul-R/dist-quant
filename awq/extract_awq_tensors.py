@@ -72,6 +72,7 @@ def extract_normalized_awq_weights(
     """
 
     linears = get_named_linears(model)
+    state_dict = model.state_dict()
     scales = awq_results.get("scale", [])
     out_dir = ensure_output_dir(output_dir)
     denom = (2 ** (bit_width - 1)) - 1
@@ -87,7 +88,14 @@ def extract_normalized_awq_weights(
             if linear_layer is None:
                 continue
 
-            weight_matrix = linear_layer.weight.detach().cpu().float().numpy()
+            weight_param = state_dict.get(f"{scale_name}.weight")
+            if weight_param is None:
+                continue
+            if weight_param.is_meta:
+                raise RuntimeError(
+                    f"Layer {scale_name} has meta weights; reload the model with real tensors (e.g., --device-map cpu)."
+                )
+            weight_matrix = weight_param.detach().cpu().float().numpy()
 
             if weight_matrix.shape[1] != scale_vector.shape[0]:
                 # Mismatched shapes are unexpected; skip to avoid silent broadcasting errors.
@@ -104,6 +112,52 @@ def extract_normalized_awq_weights(
             np.save(normalized_path, normalized_weights)
 
             yield scale_name, normalized_path
+
+
+def extract_awq_weights(
+    model,
+    awq_results: Dict,
+    output_dir: str | Path,
+) -> Iterable[Tuple[str, Path]]:
+    """Dump raw weights and their corresponding AWQ scales for each linear submodule."""
+
+    state_dict = model.state_dict()
+    linears = get_named_linears(model)
+    scales = awq_results.get("scale", [])
+    out_dir = ensure_output_dir(output_dir)
+
+    for _, scale_names, scale_tensor in scales:
+        if scale_tensor.ndim == 0:
+            continue
+
+        awq_scale = scale_tensor.detach().cpu().float().view(-1)
+
+        for scale_name in scale_names:
+            linear_layer = linears.get(scale_name)
+            if linear_layer is None:
+                continue
+
+            weight_param = state_dict.get(f"{scale_name}.weight")
+            if weight_param is None:
+                continue
+            if weight_param.is_meta:
+                raise RuntimeError(
+                    f"Layer {scale_name} has meta weights; reload the model with real tensors (e.g., --device-map cpu)."
+                )
+            weight_tensor = weight_param.detach().cpu().float()
+            if weight_tensor.shape[1] != awq_scale.shape[0]:
+                continue
+
+            payload = {
+                "weights": weight_tensor.clone(),
+                "awq_scale": awq_scale.clone(),
+            }
+
+            layer_prefix = out_dir / sanitize_name(scale_name)
+            weights_path = layer_prefix.with_name(layer_prefix.name + "_awq.pt")
+            torch.save(payload, weights_path)
+
+            yield scale_name, weights_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -131,6 +185,16 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Bit width of the signed quantizer used for AWQ (default: 4).",
     )
+    parser.add_argument(
+        "--extract-awq",
+        action="store_true",
+        help="Only dump raw AWQ weights/scales. If neither extraction flag is provided, both pipelines run.",
+    )
+    parser.add_argument(
+        "--extract-normalized",
+        action="store_true",
+        help="Only dump normalized AWQ weights. If neither extraction flag is provided, both pipelines run.",
+    )
     return parser.parse_args()
 
 
@@ -139,16 +203,24 @@ def main():
     model = load_model(args.model, torch_dtype=args.torch_dtype, device_map=args.device_map)
     awq_results = load_awq_cache(args.awq_cache)
 
-    summary = []
-    for layer_name, normalized_path in extract_normalized_awq_weights(
-        model, awq_results, args.output_dir, bit_width=args.bit_width
-    ):
-        summary.append(
-            {
-                "layer": layer_name,
-                "normalized": str(normalized_path),
-            }
-        )
+    summary_map: Dict[str, Dict[str, str]] = {}
+
+    run_awq_dump = args.extract_awq or (not args.extract_awq and not args.extract_normalized)
+    run_normalized_dump = args.extract_normalized or (not args.extract_awq and not args.extract_normalized)
+
+    if run_awq_dump:
+        for layer_name, weights_path in extract_awq_weights(model, awq_results, args.output_dir):
+            entry = summary_map.setdefault(layer_name, {"layer": layer_name})
+            entry["awq_weights"] = str(weights_path)
+
+    if run_normalized_dump:
+        for layer_name, normalized_path in extract_normalized_awq_weights(
+            model, awq_results, args.output_dir, bit_width=args.bit_width
+        ):
+            entry = summary_map.setdefault(layer_name, {"layer": layer_name})
+            entry["normalized"] = str(normalized_path)
+
+    summary = list(summary_map.values())
 
     summary_path = ensure_output_dir(args.output_dir) / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))
