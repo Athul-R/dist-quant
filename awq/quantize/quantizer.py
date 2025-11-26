@@ -143,13 +143,14 @@ def pseudo_quantize_tensor(
     max_val = w.max()
     min_val = w.min()
     delta_prob = (max_val - min_val).clamp(min=1e-5) / (2**n_bit - 1)
-    
+    assert torch.isfinite(delta_prob).all()
+
     Z = w_org / delta_prob
     mu, s = logistic_fit_torch(Z, dim=1)  # shapes (C,1), (C,1)
     U = logistic_cdf_torch(Z, mu, s)
 
     n_bit_prob = n_bit
-    EPS = 1e-5
+    EPS = 1e-3
     L = (2 ** n_bit_prob) - 1
     Uq = (torch.floor(U * L) + 0.5) / L  # midpoint quantization
     Uq = torch.clamp(Uq, EPS, 1.0 - EPS)
@@ -157,6 +158,7 @@ def pseudo_quantize_tensor(
     Z_hat = logistic_icdf_torch(Uq, mu, s)
 
     w = Z_hat * delta_prob
+    assert torch.isfinite(w).all()
 
     # if q_group_size > 0:
     #     assert org_w_shape[-1] % q_group_size == 0
@@ -179,8 +181,8 @@ def pseudo_quantize_tensor(
     #     zeros = 0
 
 
-    # assert torch.isnan(delta).sum() == 0
-    # assert torch.isnan(w).sum() == 0
+    #assert torch.isnan(scales).sum() == 0
+    #assert torch.isnan(w).sum() == 0
 
     # if inplace:
     #     (
