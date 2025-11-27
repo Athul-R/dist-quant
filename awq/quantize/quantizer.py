@@ -3,6 +3,7 @@ import torch.nn as nn
 from tqdm import tqdm
 import gc
 import numpy as np
+import time
 from scipy.stats import logistic as scipy_logistic
 from .qmodule import ScaledActivation
 from ..utils.module import set_op_by_name
@@ -183,16 +184,37 @@ def pseudo_quantize_tensor(
 
     Z = w_org / delta_prob
     EPS = 1e-3
-    mu, s = logistic_fit_torch(Z)  # shapes (C,1), (C,1)
-    U = logistic_compand(Z, mu, s)
+    max_logistic_fit_samples = 100_000
+    if Z.numel() > max_logistic_fit_samples:
+        flat_Z = Z.reshape(-1)
+        sample_idx = torch.randperm(flat_Z.numel(), device=Z.device)[
+            :max_logistic_fit_samples
+        ]
+        Z_fit = flat_Z[sample_idx]
+    else:
+        Z_fit = Z
+
+    start = time.perf_counter()
+    mu, s = logistic_fit_torch(Z_fit)  # shapes (C,1), (C,1)
+    # print(f"logistic_fit_torch took {(time.perf_counter() - start) * 1000:.3f} ms")
 
     n_bit_prob = n_bit
-    
     L = (2 ** n_bit_prob) - 1
-    Uq = (torch.floor(U * L) + 0.5) / L  # midpoint quantization
-    Uq = torch.clamp(Uq, EPS, 1.0 - EPS)
+    uq_levels = (torch.arange(L, device=Z.device, dtype=Z.dtype) + 0.5) / L
+    uq_levels = torch.clamp(uq_levels, EPS, 1.0 - EPS)
 
-    Z_hat = logistic_decompand(Uq, mu, s)
+    start = time.perf_counter()
+    quantized_levels = logistic_decompand(uq_levels, mu, s)
+    # print(
+    #     f"logistic_decompand (levels) took {(time.perf_counter() - start) * 1000:.3f} ms"
+    # )
+
+    start = time.perf_counter()
+    boundaries = (quantized_levels[:-1] + quantized_levels[1:]) / 2
+    flat_Z = Z.reshape(-1)
+    bin_idx = torch.bucketize(flat_Z, boundaries)
+    Z_hat = quantized_levels[bin_idx].reshape_as(Z)
+    # print(f"bucketize assignment took {(time.perf_counter() - start) * 1000:.3f} ms")
 
     w = Z_hat * delta_prob
     #w = torch.nan_to_num(w, nan=0.0, posinf=w.abs().max(), neginf=-1 * w.abs().max())
@@ -238,8 +260,6 @@ def pseudo_quantize_tensor(
     #     return w, delta.view(w.shape[0], -1), zeros.view(w.shape[0], -1)
     # else:
     #     return w
-
-    print("done")
 
     return w
 
