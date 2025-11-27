@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 import gc
+import numpy as np
+from scipy.stats import logistic as scipy_logistic
 from .qmodule import ScaledActivation
 from ..utils.module import set_op_by_name
 from torch import Tensor
@@ -106,31 +108,65 @@ def pseudo_quantize_tensor_old(
 
 def logistic_fit_torch(z: Tensor, dim=None, eps: float = 1e-5):
     """
-    Fit a logistic distribution to z along given dim.
-    Logistic: mean = mu, var = (pi^2 / 3) * s^2  =>  s = std * sqrt(3) / pi
-    Returns (mu, s) with dims kept for broadcasting.
+    Fit a logistic distribution to z using SciPy's maximum-likelihood estimator.
+    Keeps the requested dimension for broadcasting.
     """
-    mu = z.mean(dim=dim, keepdim=True)
-    std = z.std(dim=dim, keepdim=True) + eps
-    s = std * (3.0 ** 0.5) / torch.pi
+    device, dtype = z.device, z.dtype
+    z_np = z.detach().cpu().numpy()
+
+    if dim is None:
+        loc, scale = scipy_logistic.fit(z_np.reshape(-1))
+        scale = max(scale, eps)
+        mu = torch.tensor(loc, device=device, dtype=dtype)
+        s = torch.tensor(scale, device=device, dtype=dtype)
+        return mu, s
+
+    dim = dim if dim >= 0 else z.dim() + dim
+    arr = np.moveaxis(z_np, dim, -1)
+    flat = arr.reshape(-1, arr.shape[-1])
+    locs = np.empty(flat.shape[0], dtype=flat.dtype)
+    scales = np.empty(flat.shape[0], dtype=flat.dtype)
+
+    for idx in range(flat.shape[0]):
+        loc, scale = scipy_logistic.fit(flat[idx])
+        locs[idx] = loc
+        scales[idx] = max(scale, eps)
+
+    reduced_shape = arr.shape[:-1]
+    locs = locs.reshape(reduced_shape)
+    scales = scales.reshape(reduced_shape)
+    locs = np.expand_dims(locs, axis=dim)
+    scales = np.expand_dims(scales, axis=dim)
+
+    mu = torch.from_numpy(locs).to(device=device, dtype=dtype)
+    s = torch.from_numpy(scales).to(device=device, dtype=dtype)
     return mu, s
 
 
-def logistic_cdf_torch(z: Tensor, mu: Tensor, s: Tensor, eps: float = 1e-5) -> Tensor:
+def logistic_compand(z: Tensor, mu: Tensor, s: Tensor, eps: float = 1e-5) -> Tensor:
     """
-    Logistic CDF (sigmoid) with clamping to avoid exact 0/1, which would explode logit.
+    Compand tensor z to the uniform domain using SciPy's logistic CDF evaluated on CPU.
     """
-    out = torch.sigmoid((z - mu) / s)
-    return torch.clamp(out, eps, 1.0 - eps)
+    device, dtype = z.device, z.dtype
+    z_np = z.detach().cpu().numpy()
+    mu_np = mu.detach().cpu().numpy()
+    s_np = s.detach().cpu().numpy()
+    u_np = scipy_logistic.cdf(z_np, loc=mu_np, scale=s_np)
+    u = torch.from_numpy(u_np).to(device=device, dtype=dtype)
+    return torch.clamp(u, eps, 1.0 - eps)
 
 
-def logistic_icdf_torch(u: Tensor, mu: Tensor, s: Tensor, eps: float = 1e-5) -> Tensor:
+def logistic_decompand(u: Tensor, mu: Tensor, s: Tensor, eps: float = 1e-5) -> Tensor:
     """
-    Logistic inverse CDF (quantile):
-    F^{-1}(u) = mu + s * log(u / (1 - u))
+    Map tensor u from the uniform domain back to the logistic domain via SciPy's PPF.
     """
-    logit_u = torch.logit(u, eps=eps)
-    return mu + s * logit_u
+    device, dtype = u.device, u.dtype
+    u_np = u.detach().cpu().numpy()
+    mu_np = mu.detach().cpu().numpy()
+    s_np = s.detach().cpu().numpy()
+    # ensure inputs stay away from exact 0/1 before calling the inverse CDF
+    z_np = scipy_logistic.ppf(np.clip(u_np, eps, 1.0 - eps), loc=mu_np, scale=s_np)
+    return torch.from_numpy(z_np).to(device=device, dtype=dtype)
 
    
 
@@ -146,9 +182,9 @@ def pseudo_quantize_tensor(
     assert torch.isfinite(delta_prob).all()
 
     Z = w_org / delta_prob
-    EPS = 1e-4
-    mu, s = logistic_fit_torch(Z, dim=1)  # shapes (C,1), (C,1)
-    U = logistic_cdf_torch(Z, mu, s)
+    EPS = 1e-3
+    mu, s = logistic_fit_torch(Z)  # shapes (C,1), (C,1)
+    U = logistic_compand(Z, mu, s)
 
     n_bit_prob = n_bit
     
@@ -156,10 +192,10 @@ def pseudo_quantize_tensor(
     Uq = (torch.floor(U * L) + 0.5) / L  # midpoint quantization
     Uq = torch.clamp(Uq, EPS, 1.0 - EPS)
 
-    Z_hat = logistic_icdf_torch(Uq, mu, s)
+    Z_hat = logistic_decompand(Uq, mu, s)
 
     w = Z_hat * delta_prob
-    w = torch.nan_to_num(w, nan=0.0, posinf=w.abs().max(), neginf=-1*w.abs().max())
+    #w = torch.nan_to_num(w, nan=0.0, posinf=w.abs().max(), neginf=-1 * w.abs().max())
     assert torch.isfinite(w).all()
 
     # if q_group_size > 0:
@@ -202,6 +238,8 @@ def pseudo_quantize_tensor(
     #     return w, delta.view(w.shape[0], -1), zeros.view(w.shape[0], -1)
     # else:
     #     return w
+
+    print("done")
 
     return w
 
