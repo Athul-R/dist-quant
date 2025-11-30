@@ -273,14 +273,21 @@ def pseudo_quantize_tensor(
         assert torch.isfinite(w).all()
         assert torch.isfinite(delta).all()
     except:
-        finite_mask = torch.isfinite(w)
-        max_real_value = w[finite_mask].max()
+        pass
+    #     # Replace non-finite values with a safe fallback
+    #     finite_mask = torch.isfinite(w)
+    #     if finite_mask.any():
+    #         max_real_value = w[finite_mask].max()
+    #         w = torch.nan_to_num(w, nan=0.0, posinf=max_real_value, neginf=-max_real_value)
+    #     else:
+    #         w = torch.zeros_like(w)
 
-        finite_mask_delta = torch.isfinite(delta)
-        max_real_value_delta = delta[finite_mask_delta].max()
-
-        w = torch.nan_to_num(w, nan=0.0, posinf=max_real_value, neginf=-max_real_value)
-        delta = torch.nan_to_num(delta, nan=0.0, posinf=max_real_value_delta, neginf=-max_real_value_delta)
+    #     finite_mask_delta = torch.isfinite(delta)
+    #     if finite_mask_delta.any():
+    #         max_real_value_delta = delta[finite_mask_delta].max()
+    #         delta = torch.nan_to_num(delta, nan=0.0, posinf=max_real_value_delta, neginf=-max_real_value_delta)
+    #     else:
+    #         delta = torch.zeros_like(delta)
     
     if inplace:
         (
@@ -295,9 +302,14 @@ def pseudo_quantize_tensor(
         assert torch.isnan(w).sum() == 0
         assert torch.isfinite(w).all()
     except:
-        finite_mask = torch.isfinite(w)
-        max_real_value = w[finite_mask].max()
-        w = torch.nan_to_num(w, nan=0.0, posinf=max_real_value, neginf=-max_real_value)
+        pass
+    #     # Replace non-finite values with a safe fallback
+    #     finite_mask = torch.isfinite(w)
+    #     if finite_mask.any():
+    #         max_real_value = w[finite_mask].max()
+    #         w = torch.nan_to_num(w, nan=0.0, posinf=max_real_value, neginf=-max_real_value)
+    #     else:
+    #         w = torch.zeros_like(w)
 
     # Clamp to the valid (0,1) range before applying the logit/PPF. Quantization
     # can push values to exact 0/1 which would otherwise lead to inf/nan.
@@ -306,6 +318,14 @@ def pseudo_quantize_tensor(
     w = logistic_ppf(w, loc=mu, scale=s)
     delta = logistic_ppf(delta, loc=mu, scale=s)
     w = w.reshape(org_w_shape)
+
+    try: 
+        assert torch.isnan(delta).sum() == 0
+        assert torch.isnan(w).sum() == 0
+        assert torch.isfinite(w).all()
+        assert torch.isfinite(delta).all()
+    except:
+        pass
 
     end = time.perf_counter()
     # print(f"Total time taken is: {end - start}")

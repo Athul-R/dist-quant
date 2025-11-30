@@ -121,17 +121,26 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat):
         best_ratio = -1
         best_scales = None
 
-        n_grid = 20
+        n_grid = 1
         history = []
 
         org_sd = {k: v.cpu() for k, v in block.state_dict().items()}
         for ratio in range(n_grid):
             ratio = ratio * 1 / n_grid
             scales = x_max.pow(ratio).clamp(min=1e-4).view(-1)
-            scales = scales / (scales.max() * scales.min()).sqrt()
+            # Prevent division by zero in normalization
+            scales_product = (scales.max() * scales.min()).clamp(min=1e-8).sqrt()
+            scales = scales / scales_product
             for fc in linears2scale:
                 fc.weight.mul_(scales.view(1, -1).to(fc.weight.device))
-                fc.weight.data = w_quantize_func(fc.weight.data) / (scales.view(1, -1))
+                # Add clamping after quantization to prevent extreme values
+                quantized_weight = w_quantize_func(fc.weight.data)
+                quantized_weight = torch.clamp(quantized_weight, min=-1e4, max=1e4)
+                # Prevent division by zero/very small scales
+                safe_scales = scales.view(1, -1).clamp(min=1e-5)
+                fc.weight.data = quantized_weight / safe_scales
+                # Final safety check
+                fc.weight.data = torch.nan_to_num(fc.weight.data, nan=0.0, posinf=1e4, neginf=-1e4)
             out = block(x, **kwargs)
             if isinstance(out, tuple):
                 out = out[0]

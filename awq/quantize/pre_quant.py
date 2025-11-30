@@ -172,6 +172,8 @@ def run_awq(
 
     # solve layer by layer
     for i in tqdm.tqdm(range(len(layers)), desc="Running AWQ..."):
+        # if i < 20: 
+        #     continue
         layer = layers[i]
         layer = layer.cuda()
         named_linears = get_named_linears(layer)
@@ -224,7 +226,7 @@ def run_awq(
         #     if "Allocated" in line:
         #         print(line)
 
-        if mse_range:
+        if not mse_range:
             clip_list = auto_clip_block(
                 layer,
                 w_bit=w_bit,
