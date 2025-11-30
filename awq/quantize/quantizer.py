@@ -58,7 +58,7 @@ def scale_activations(module):
 
 
 # core quantization method (simulated quantization)
-def pseudo_quantize_tensor(
+def pseudo_quantize_tensor_old(
     w, n_bit=8, zero_point=True, q_group_size=-1, inplace=False, get_scale_zp=False
 ):
     org_w_shape = w.shape
@@ -101,6 +101,113 @@ def pseudo_quantize_tensor(
         return w, scales.view(w.shape[0], -1), zeros.view(w.shape[0], -1)
     else:
         return w
+
+
+import torch
+import math
+
+def pseudo_quantize_tensor(
+    w,
+    n_bit=8,
+    q_group_size=-1,
+    inplace=False,
+    get_codebook=False,
+    zero_point=True,
+):
+    """
+    Non-uniform quantization using a Gaussian-based codebook.
+
+    - Works similarly to pseudo_quantize_tensor, but instead of a linear
+      scale+zero-point, it builds a per-row codebook of quantization levels.
+    - Codebook centers are chosen using the inverse CDF of a normal distribution
+      with row-wise mean and variance (so bins are denser near the mean).
+
+    Args:
+        w:            weight tensor (last dim is grouped if q_group_size > 0)
+        n_bit:        number of bits (number of levels = 2 ** n_bit)
+        q_group_size: group size along the last dimension; if > 0, we reshape
+                      to (-1, q_group_size) just like in the AWQ code.
+        inplace:      if True, writes the quantized values back into `w`
+        get_codebook: if True, also returns the codebook (centers) per row
+
+    Returns:
+        If get_codebook is False:
+            w_q          (quantized tensor, same shape as input)
+        If get_codebook is True:
+            w_q, centers
+            - w_q:      quantized tensor, same shape as input
+            - centers:  (num_rows, num_levels) codebook per row
+    """
+
+    org_shape = w.shape
+
+    # Handle grouping like in original AWQ pseudo_quantize_tensor
+    if q_group_size > 0:
+        assert org_shape[-1] % q_group_size == 0
+        w_2d = w.reshape(-1, q_group_size)
+    else:
+        w_2d = w.reshape(w.shape[0], -1)
+
+    assert w_2d.dim() == 2
+    num_rows, row_dim = w_2d.shape
+
+    num_levels = 2 ** n_bit
+    device = w.device
+    dtype = w.dtype
+
+    # ---- 1. Row-wise mean and variance ----
+    # (You can make this per-tensor by removing dim=1 and keepdim=True if you want.)
+    mean = w_2d.mean(dim=1, keepdim=True)                     # (num_rows, 1)
+    var = w_2d.var(dim=1, unbiased=False, keepdim=True)       # (num_rows, 1)
+    std = var.clamp(min=1e-5).sqrt()                          # avoid zero-variance
+
+    # ---- 2. Build Gaussian-based quantization centers (codebook) ----
+    # We put the centers at Gaussian quantiles:
+    # p_k = (k + 0.5) / num_levels  for k=0,...,L-1
+    # z_k = Phi^{-1}(p_k)  (standard normal)
+    # center_k = mean + std * z_k
+    #
+    # Using erfinv: Phi^{-1}(p) = sqrt(2) * erfinv(2p - 1)
+
+    k = torch.arange(num_levels, device=device, dtype=dtype)          # (L,)
+    p = (k + 0.5) / num_levels                                        # (L,), in (0,1)
+    # Standard normal quantiles
+    z = math.sqrt(2.0) * torch.erfinv(2 * p - 1)                      # (L,)
+
+    # Expand to per-row codebook: centers shape (num_rows, num_levels)
+    centers = mean + std * z.unsqueeze(0)
+
+    # ---- 3. Assign each weight to nearest center (non-uniform quantization) ----
+    # w_2d:      (num_rows, row_dim)
+    # centers:   (num_rows, num_levels)
+    # We want nearest center along the "levels" axis.
+    #
+    # diff: (num_rows, row_dim, num_levels)
+    diff = w_2d.unsqueeze(-1) - centers.unsqueeze(1)
+    idx = diff.abs().argmin(dim=-1)                      # (num_rows, row_dim), indices in [0, num_levels-1]
+
+    # Gather quantized values from centers
+    w_q_2d = centers.gather(1, idx)                      # (num_rows, row_dim)
+
+    # ---- 4. Write back (in-place or not) ----
+    if inplace:
+        # respect the original tensor storage
+        if q_group_size > 0:
+            w.view(-1, q_group_size).copy_(w_q_2d)
+        else:
+            w.view(w.shape[0], -1).copy_(w_q_2d)
+        w_q = w
+    else:
+        w_q = w_q_2d.reshape(org_shape)
+
+    assert torch.isnan(w_q).sum() == 0
+
+    if get_codebook:
+        # reshape centers to match "rows" after grouping
+        return w_q, centers
+    else:
+        return w_q
+
 
 
 @torch.no_grad()
