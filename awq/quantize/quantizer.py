@@ -8,6 +8,7 @@ from scipy.stats import logistic as scipy_logistic
 from .qmodule import ScaledActivation
 from ..utils.module import set_op_by_name
 from torch import Tensor
+import math
 
 from transformers.models.bloom.modeling_bloom import BloomBlock
 
@@ -107,6 +108,27 @@ def pseudo_quantize_tensor_old(
         return w
     
 
+
+def logistic_fit_torch_gpu(z: Tensor, dim=None, eps: float = 1e-5):
+    """
+    Fit a logistic distribution to z using the method of moments on the GPU.
+    Keeps the requested dimension for broadcasting.
+    """
+    if dim is None:
+        mu = torch.mean(z)
+        var = torch.var(z)
+    else:
+        mu = torch.mean(z, dim=dim, keepdim=True)
+        var = torch.var(z, dim=dim, keepdim=True)
+
+    # Method of Moments estimation for the scale parameter 's'
+    # s = sqrt(3 * var) / pi
+    s = torch.sqrt(3 * var) / math.pi
+    s = s.clamp(min=eps)
+
+    return mu, s
+
+
 def logistic_fit_torch(z: Tensor, dim=None, eps: float = 1e-5):
     """
     Fit a logistic distribution to z using SciPy's maximum-likelihood estimator.
@@ -165,7 +187,7 @@ def logistic_ppf(u, loc, scale):
    
 
 def pseudo_quantize_tensor(
-    w, n_bit=8, zero_point=True, q_group_size=-1, inplace=False, get_scale_zp=False
+    w, n_bit=8, zero_point=True, q_group_size=-1, inplace=False, get_scale_zp=False, use_gpu_fitting=True
 ):
     org_w_shape = w.shape
     w_org = w
@@ -177,6 +199,7 @@ def pseudo_quantize_tensor(
     # min_val = w.min()
     # delta_prob = (max_val - min_val).clamp(min=1e-5) / (2**n_bit - 1)
     # assert torch.isfinite(delta_prob).all()
+
 
     # Z = w_org / delta_prob
     # EPS = 1e-3
@@ -191,8 +214,10 @@ def pseudo_quantize_tensor(
         w_fit = w
 
     start = time.perf_counter()
-    mu, s = logistic_fit_torch(w_fit)  # shapes (C,1), (C,1)
-
+    if use_gpu_fitting:
+        mu, s = logistic_fit_torch_gpu(w_fit)
+    else:
+        mu, s = logistic_fit_torch(w_fit)  # shapes (C,1), (C,1)
     w = logistic_cdf(w, loc=mu, scale=s)
 
 
@@ -223,6 +248,9 @@ def pseudo_quantize_tensor(
     if q_group_size > 0:
         assert org_w_shape[-1] % q_group_size == 0
         w = w.reshape(-1, q_group_size)
+        if use_gpu_fitting:
+            # For group-wise quantization, we need to re-calculate mu and s for each group
+            mu, s = logistic_fit_torch_gpu(w_org.reshape(-1, q_group_size), dim=1)
     assert w.dim() == 2
     if zero_point:
         max_val = w.amax(dim=1, keepdim=True)
@@ -263,16 +291,16 @@ def pseudo_quantize_tensor(
     w = w.reshape(org_w_shape)
 
     end = time.perf_counter()
-    print(f"Total time taken is: {end - start}")
+    # print(f"Total time taken is: {end - start}")
 
-    # # print(f"W: {w}")
+    # print(f"W: {w}")
     # print("\n\nMSE >>>>")
     # mse = ((w_org - w) ** 2).mean()
     # print(mse)
     # orig_mag = w_org.abs().mean()
     # quant_mag = w.abs().mean()
-    # print("Mean |w_org|:", orig_mag.item())
-    # print("Mean |w|:", quant_mag.item())
+    # # print("Mean |w_org|:", orig_mag.item())
+    # # print("Mean |w|:", quant_mag.item())
     # print("|w_org| / |w| =", (orig_mag / quant_mag).item())
 
     
