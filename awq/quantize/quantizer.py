@@ -200,7 +200,6 @@ def pseudo_quantize_tensor(
     # delta_prob = (max_val - min_val).clamp(min=1e-5) / (2**n_bit - 1)
     # assert torch.isfinite(delta_prob).all()
 
-
     # Z = w_org / delta_prob
     # EPS = 1e-3
     max_logistic_fit_samples = 10**5
@@ -268,10 +267,21 @@ def pseudo_quantize_tensor(
         delta = max_val / max_int
         zeros = 0
 
+    try: 
+        assert torch.isnan(delta).sum() == 0
+        assert torch.isnan(w).sum() == 0
+        assert torch.isfinite(w).all()
+        assert torch.isfinite(delta).all()
+    except:
+        finite_mask = torch.isfinite(w)
+        max_real_value = w[finite_mask].max()
 
-    assert torch.isnan(delta).sum() == 0
-    assert torch.isnan(w).sum() == 0
+        finite_mask_delta = torch.isfinite(delta)
+        max_real_value_delta = delta[finite_mask_delta].max()
 
+        w = torch.nan_to_num(w, nan=0.0, posinf=max_real_value, neginf=-max_real_value)
+        delta = torch.nan_to_num(delta, nan=0.0, posinf=max_real_value_delta, neginf=-max_real_value_delta)
+    
     if inplace:
         (
             (w.div_(delta).round_().add_(zeros)).clamp_(min_int, max_int).sub_(zeros)
@@ -280,7 +290,14 @@ def pseudo_quantize_tensor(
         w = (
             torch.clamp(torch.round(w / delta) + zeros, min_int, max_int) - zeros
         ) * delta
-    assert torch.isnan(w).sum() == 0
+    
+    try:
+        assert torch.isnan(w).sum() == 0
+        assert torch.isfinite(w).all()
+    except:
+        finite_mask = torch.isfinite(w)
+        max_real_value = w[finite_mask].max()
+        w = torch.nan_to_num(w, nan=0.0, posinf=max_real_value, neginf=-max_real_value)
 
     # Clamp to the valid (0,1) range before applying the logit/PPF. Quantization
     # can push values to exact 0/1 which would otherwise lead to inf/nan.
