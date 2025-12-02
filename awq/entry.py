@@ -52,6 +52,17 @@ parser.add_argument("--w_bit", type=int, default=None)
 parser.add_argument("--q_group_size", type=int, default=-1)
 parser.add_argument("--no_zero_point", action="store_true", help="disable zero_point")
 parser.add_argument("--q_backend", type=str, default="fake", choices=["fake", "real"])
+parser.add_argument(
+    "--quant_debug",
+    action="store_true",
+    help="Log non-uniform quantization stats while pseudo quantizing weights",
+)
+parser.add_argument(
+    "--codebook_spread",
+    type=float,
+    default=1.5,
+    help="Multiply Gaussian std by this factor so codebook spans a wider range",
+)
 # save/load real quantized weights
 parser.add_argument("--dump_quant", type=str, default=None, help="save quantized model")
 parser.add_argument(
@@ -113,6 +124,8 @@ if args.auto_parallel:
 q_config = {
     "zero_point": not args.no_zero_point,  # by default True
     "q_group_size": args.q_group_size,  # whether to use group quantization
+    "debug": args.quant_debug,
+    "codebook_spread": args.codebook_spread,
 }
 print("Quantization config:", q_config)
 

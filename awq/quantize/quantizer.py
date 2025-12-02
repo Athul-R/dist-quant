@@ -1,5 +1,7 @@
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 import gc
 from .qmodule import ScaledActivation
@@ -103,9 +105,6 @@ def pseudo_quantize_tensor_old(
         return w
 
 
-import torch
-import math
-
 def pseudo_quantize_tensor(
     w,
     n_bit=8,
@@ -113,6 +112,10 @@ def pseudo_quantize_tensor(
     inplace=False,
     get_codebook=False,
     zero_point=True,
+    debug=False,
+    debug_prefix=None,
+    get_scale_zp=False,
+    codebook_spread=1.0,
 ):
     """
     Non-uniform quantization using a Gaussian-based codebook.
@@ -138,6 +141,12 @@ def pseudo_quantize_tensor(
             - w_q:      quantized tensor, same shape as input
             - centers:  (num_rows, num_levels) codebook per row
     """
+
+    if get_scale_zp:
+        raise NotImplementedError(
+            "Non-uniform pseudo quantization does not expose (scale, zero_point). "
+            "Use pseudo_quantize_tensor_old for kernels that require them."
+        )
 
     org_shape = w.shape
 
@@ -175,7 +184,7 @@ def pseudo_quantize_tensor(
     z = math.sqrt(2.0) * torch.erfinv(2 * p - 1)                      # (L,)
 
     # Expand to per-row codebook: centers shape (num_rows, num_levels)
-    centers = mean + std * z.unsqueeze(0)
+    centers = mean + (std * codebook_spread) * z.unsqueeze(0)
 
     # ---- 3. Assign each weight to nearest center (non-uniform quantization) ----
     # w_2d:      (num_rows, row_dim)
@@ -189,6 +198,11 @@ def pseudo_quantize_tensor(
     # Gather quantized values from centers
     w_q_2d = centers.gather(1, idx)                      # (num_rows, row_dim)
 
+    if debug:
+        _log_non_uniform_quant_stats(
+            debug_prefix or "pseudo_quantize_tensor", w_2d, w_q_2d, centers, idx
+        )
+
     # ---- 4. Write back (in-place or not) ----
     if inplace:
         # respect the original tensor storage
@@ -201,12 +215,47 @@ def pseudo_quantize_tensor(
         w_q = w_q_2d.reshape(org_shape)
 
     assert torch.isnan(w_q).sum() == 0
+    assert torch.isfinite(w_q).all()
 
     if get_codebook:
         # reshape centers to match "rows" after grouping
         return w_q, centers
     else:
         return w_q
+
+
+def _log_non_uniform_quant_stats(prefix, w_orig, w_quant, centers, idx):
+    """Print a small collection of stats that make debugging easier."""
+    diff = (w_quant - w_orig).abs()
+    mean_abs_err = diff.mean().item()
+    max_abs_err = diff.max().item()
+    cos = F.cosine_similarity(
+        w_orig.reshape(1, -1).float(), w_quant.reshape(1, -1).float(), dim=1
+    ).item()
+
+    row_range = w_orig.max(dim=1).values - w_orig.min(dim=1).values
+    codebook_range = centers.max(dim=1).values - centers.min(dim=1).values
+    range_ratio = (row_range / (codebook_range + 1e-6)).mean().item()
+
+    num_levels = centers.shape[1]
+    idx_equal_min = (idx == 0).float()
+    idx_equal_max = (idx == num_levels - 1).float()
+    clip_low = idx_equal_min.mean().item()
+    clip_high = idx_equal_max.mean().item()
+    heavy_clip_rows = (
+        (idx_equal_min.mean(dim=1) > 0.25) | (idx_equal_max.mean(dim=1) > 0.25)
+    ).float()
+
+    print(
+        f"[quant-debug] {prefix}: mean|err|={mean_abs_err:.4e}, "
+        f"max|err|={max_abs_err:.4e}, cos={cos:.4f}, "
+        f"range_ratio={range_ratio:.2f}"
+    )
+    print(
+        f"[quant-debug] {prefix}: clip_low={clip_low * 100:.2f}%, "
+        f"clip_high={clip_high * 100:.2f}%, "
+        f"rows>25%clipped={heavy_clip_rows.mean().item() * 100:.2f}%"
+    )
 
 
 
@@ -219,12 +268,16 @@ def pseudo_quantize_model_weight(
     from .pre_quant import get_blocks, get_named_linears
 
     layers = get_blocks(model)
+    debug_enabled = q_config.get("debug", False)
     for i in tqdm(range(len(layers)), desc="pseudo weight quantization..."):
         named_linears = get_named_linears(layers[i])
         for n, m in named_linears.items():
             m.cuda()
+            extra_kwargs = {}
+            if debug_enabled:
+                extra_kwargs["debug_prefix"] = f"layer_{i}.{n}"
             m.weight.data = pseudo_quantize_tensor(
-                m.weight.data, n_bit=w_bit, **q_config
+                m.weight.data, n_bit=w_bit, **q_config, **extra_kwargs
             )
             m.cpu()
 
