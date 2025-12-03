@@ -60,8 +60,13 @@ parser.add_argument(
 parser.add_argument(
     "--codebook_spread",
     type=float,
-    default=1.5,
+    default=1.0,
     help="Multiply Gaussian std by this factor so codebook spans a wider range",
+)
+parser.add_argument(
+    "--fixed_scale",
+    action="store_true",
+    help="Don't do scale search during AWQ, use the scale from weight quantization directly",
 )
 # save/load real quantized weights
 parser.add_argument("--dump_quant", type=str, default=None, help="save quantized model")
@@ -126,6 +131,7 @@ q_config = {
     "q_group_size": args.q_group_size,  # whether to use group quantization
     "debug": args.quant_debug,
     "codebook_spread": args.codebook_spread,
+    "fixed_scale":args.fixed_scale,
 }
 print("Quantization config:", q_config)
 

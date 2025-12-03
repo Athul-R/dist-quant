@@ -121,35 +121,42 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat):
         best_ratio = -1
         best_scales = None
 
-        n_grid = 20
-        history = []
-
-        org_sd = {k: v.cpu() for k, v in block.state_dict().items()}
-        for ratio in range(n_grid):
-            ratio = ratio * 1 / n_grid
+        if q_config.get("fixed_scale", False):
+            ratio = 0
             scales = x_max.pow(ratio).clamp(min=1e-4).view(-1)
             scales = scales / (scales.max() * scales.min()).sqrt()
-            for fc in linears2scale:
-                fc.weight.mul_(scales.view(1, -1).to(fc.weight.device))
-                fc.weight.data = w_quantize_func(fc.weight.data) / (scales.view(1, -1))
-            out = block(x, **kwargs)
-            if isinstance(out, tuple):
-                out = out[0]
+            best_scales = scales
 
-            loss = (
-                (org_out - out).float().pow(2).mean().item()
-            )  # float prevents overflow
-            history.append(loss)
-            is_best = loss < best_error
-            if is_best:
-                best_error = loss
-                best_ratio = ratio
-                best_scales = scales
-            block.load_state_dict(org_sd)
-        if best_ratio == -1:
-            print(history)
-            raise Exception
-        # print(best_ratio)
+        else:
+            n_grid = 20
+            history = []
+            org_sd = {k: v.cpu() for k, v in block.state_dict().items()}
+            for ratio in range(n_grid):
+                ratio = ratio * 1 / n_grid
+                scales = x_max.pow(ratio).clamp(min=1e-4).view(-1)
+                scales = scales / (scales.max() * scales.min()).sqrt()
+                for fc in linears2scale:
+                    fc.weight.mul_(scales.view(1, -1).to(fc.weight.device))
+                    fc.weight.data = w_quantize_func(fc.weight.data) / (scales.view(1, -1))
+                out = block(x, **kwargs)
+                if isinstance(out, tuple):
+                    out = out[0]
+
+                loss = (
+                    (org_out - out).float().pow(2).mean().item()
+                )  # float prevents overflow
+                history.append(loss)
+                is_best = loss < best_error
+                if is_best:
+                    best_error = loss
+                    best_ratio = ratio
+                    best_scales = scales
+                block.load_state_dict(org_sd)
+            if best_ratio == -1:
+                print(history)
+                raise Exception
+            # print(best_ratio)
+        
         best_scales = best_scales.view(-1)
 
         assert torch.isnan(best_scales).sum() == 0, best_scales

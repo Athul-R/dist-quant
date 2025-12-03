@@ -61,7 +61,7 @@ def scale_activations(module):
 
 # core quantization method (simulated quantization)
 def pseudo_quantize_tensor_old(
-    w, n_bit=8, zero_point=True, q_group_size=-1, inplace=False, get_scale_zp=False
+    w, n_bit=8, zero_point=True, q_group_size=-1, inplace=False, get_scale_zp=False, **kwargs
 ):
     org_w_shape = w.shape
     if q_group_size > 0:
@@ -116,6 +116,7 @@ def pseudo_quantize_tensor(
     debug_prefix=None,
     get_scale_zp=False,
     codebook_spread=1.0,
+    **kwargs
 ):
     """
     Non-uniform quantization using a Gaussian-based codebook.
