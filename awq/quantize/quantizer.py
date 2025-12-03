@@ -60,7 +60,7 @@ def scale_activations(module):
 
 
 # core quantization method (simulated quantization)
-def pseudo_quantize_tensor_old(
+def pseudo_quantize_tensor_uniform(
     w, n_bit=8, zero_point=True, q_group_size=-1, inplace=False, get_scale_zp=False, **kwargs
 ):
     org_w_shape = w.shape
@@ -105,7 +105,41 @@ def pseudo_quantize_tensor_old(
         return w
 
 
-def pseudo_quantize_tensor(
+def _reshape_for_group_quantization(w, q_group_size):
+    org_shape = w.shape
+    if q_group_size > 0:
+        assert org_shape[-1] % q_group_size == 0
+        w_2d = w.reshape(-1, q_group_size)
+    else:
+        w_2d = w.reshape(w.shape[0], -1)
+    assert w_2d.dim() == 2
+    return w_2d, org_shape
+
+
+def _restore_quantized_weights(w, w_q_2d, q_group_size, org_shape, inplace):
+    if inplace:
+        if q_group_size > 0:
+            w.view(-1, q_group_size).copy_(w_q_2d)
+        else:
+            w.view(w.shape[0], -1).copy_(w_q_2d)
+        return w
+    else:
+        return w_q_2d.reshape(org_shape)
+
+
+def _assign_to_codebook(w_2d, centers):
+    diff = w_2d.unsqueeze(-1) - centers.unsqueeze(1)
+    idx = diff.abs().argmin(dim=-1)
+    w_q_2d = centers.gather(1, idx)
+    return w_q_2d, idx
+
+
+def _assert_finite(tensor):
+    assert torch.isnan(tensor).sum() == 0
+    assert torch.isfinite(tensor).all()
+
+
+def pseudo_quantize_tensor_normal(
     w,
     n_bit=8,
     q_group_size=-1,
@@ -149,17 +183,8 @@ def pseudo_quantize_tensor(
             "Use pseudo_quantize_tensor_old for kernels that require them."
         )
 
-    org_shape = w.shape
-
-    # Handle grouping like in original AWQ pseudo_quantize_tensor
-    if q_group_size > 0:
-        assert org_shape[-1] % q_group_size == 0
-        w_2d = w.reshape(-1, q_group_size)
-    else:
-        w_2d = w.reshape(w.shape[0], -1)
-
-    assert w_2d.dim() == 2
-    num_rows, row_dim = w_2d.shape
+    w_2d, org_shape = _reshape_for_group_quantization(w, q_group_size)
+    num_rows, _ = w_2d.shape
 
     num_levels = 2 ** n_bit
     device = w.device
@@ -179,10 +204,15 @@ def pseudo_quantize_tensor(
     #
     # Using erfinv: Phi^{-1}(p) = sqrt(2) * erfinv(2p - 1)
 
-    k = torch.arange(num_levels, device=device, dtype=dtype)          # (L,)
-    p = (k + 0.5) / num_levels                                        # (L,), in (0,1)
+    working_dtype = (
+        torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+    )
+    k = torch.arange(num_levels, device=device, dtype=working_dtype)          # (L,)
+    p = (k + 0.5) / num_levels                                                # (L,), in (0,1)
     # Standard normal quantiles
-    z = math.sqrt(2.0) * torch.erfinv(2 * p - 1)                      # (L,)
+    z = math.sqrt(2.0) * torch.erfinv(2 * p - 1)                              # (L,)
+    if z.dtype != dtype:
+        z = z.to(dtype)
 
     # Expand to per-row codebook: centers shape (num_rows, num_levels)
     centers = mean + (std * codebook_spread) * z.unsqueeze(0)
@@ -193,36 +223,108 @@ def pseudo_quantize_tensor(
     # We want nearest center along the "levels" axis.
     #
     # diff: (num_rows, row_dim, num_levels)
-    diff = w_2d.unsqueeze(-1) - centers.unsqueeze(1)
-    idx = diff.abs().argmin(dim=-1)                      # (num_rows, row_dim), indices in [0, num_levels-1]
-
-    # Gather quantized values from centers
-    w_q_2d = centers.gather(1, idx)                      # (num_rows, row_dim)
+    w_q_2d, idx = _assign_to_codebook(w_2d, centers)
 
     if debug:
         _log_non_uniform_quant_stats(
             debug_prefix or "pseudo_quantize_tensor", w_2d, w_q_2d, centers, idx
         )
 
-    # ---- 4. Write back (in-place or not) ----
-    if inplace:
-        # respect the original tensor storage
-        if q_group_size > 0:
-            w.view(-1, q_group_size).copy_(w_q_2d)
-        else:
-            w.view(w.shape[0], -1).copy_(w_q_2d)
-        w_q = w
-    else:
-        w_q = w_q_2d.reshape(org_shape)
-
-    assert torch.isnan(w_q).sum() == 0
-    assert torch.isfinite(w_q).all()
+    w_q = _restore_quantized_weights(w, w_q_2d, q_group_size, org_shape, inplace)
+    _assert_finite(w_q)
 
     if get_codebook:
         # reshape centers to match "rows" after grouping
         return w_q, centers
     else:
         return w_q
+
+
+def pseudo_quantize_tensor_logistic(
+    w,
+    n_bit=8,
+    q_group_size=-1,
+    inplace=False,
+    get_codebook=False,
+    zero_point=True,
+    debug=False,
+    debug_prefix=None,
+    get_scale_zp=False,
+    codebook_spread=1.0,
+    **kwargs,
+):
+    """Non-uniform quantization using a logistic distribution derived codebook."""
+
+    if get_scale_zp:
+        raise NotImplementedError(
+            "Logistic pseudo quantization does not expose (scale, zero_point)."
+        )
+
+    w_2d, org_shape = _reshape_for_group_quantization(w, q_group_size)
+    num_levels = 2 ** n_bit
+    device = w.device
+    dtype = w.dtype
+
+    mean = w_2d.mean(dim=1, keepdim=True)
+    var = w_2d.var(dim=1, unbiased=False, keepdim=True)
+    std = var.clamp(min=1e-5).sqrt()
+    spread_std = std * codebook_spread
+    logistic_scale = (spread_std * math.sqrt(3.0) / math.pi).clamp(min=1e-5)
+
+    working_dtype = (
+        torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+    )
+    k = torch.arange(num_levels, device=device, dtype=working_dtype)
+    p = (k + 0.5) / num_levels
+    z = torch.logit(p, eps=1e-6)
+    if z.dtype != dtype:
+        z = z.to(dtype)
+
+    centers = mean + logistic_scale * z.unsqueeze(0)
+    w_q_2d, idx = _assign_to_codebook(w_2d, centers)
+
+    if debug:
+        _log_non_uniform_quant_stats(
+            debug_prefix or "pseudo_quantize_tensor_logistic",
+            w_2d,
+            w_q_2d,
+            centers,
+            idx,
+        )
+
+    w_q = _restore_quantized_weights(w, w_q_2d, q_group_size, org_shape, inplace)
+    _assert_finite(w_q)
+
+    if get_codebook:
+        return w_q, centers
+    else:
+        return w_q
+
+
+def pseudo_quantize_tensor(
+    w,
+    *args,
+    quant_method="uniform",
+    **kwargs,
+):
+    """Dispatch to the requested pseudo quantization routine."""
+
+    method = kwargs.pop("quant_method", quant_method)
+    method = (method or "uniform").lower()
+
+    if kwargs.get("get_scale_zp") and method != "uniform":
+        raise NotImplementedError(
+            "Only uniform quantization supports (scale, zero_point) outputs."
+        )
+
+    if method == "uniform":
+        return pseudo_quantize_tensor_uniform(w, *args, **kwargs)
+    if method in ("normal", "gaussian"):
+        return pseudo_quantize_tensor_normal(w, *args, **kwargs)
+    if method == "logistic":
+        return pseudo_quantize_tensor_logistic(w, *args, **kwargs)
+
+    raise ValueError(f"Unsupported quantization method: {method}")
 
 
 def _log_non_uniform_quant_stats(prefix, w_orig, w_quant, centers, idx):

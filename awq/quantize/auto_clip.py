@@ -53,6 +53,7 @@ def auto_clip_layer(
             min_errs[cur_best_idx] = err[cur_best_idx]
             best_max_val[cur_best_idx] = max_val[cur_best_idx]
         best_max_val_all.append(best_max_val)
+        #print("Clipped to {}".format((best_max_val/org_max_val).mean().item()))
 
     best_max_val = torch.cat(best_max_val_all, dim=0)
 

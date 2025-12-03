@@ -64,6 +64,13 @@ parser.add_argument(
     help="Multiply Gaussian std by this factor so codebook spans a wider range",
 )
 parser.add_argument(
+    "--quant_method",
+    type=str,
+    default="uniform",
+    choices=["uniform", "normal", "logistic"],
+    help="Pseudo quantization scheme to simulate (uniform, Gaussian, or logistic)",
+)
+parser.add_argument(
     "--fixed_scale",
     action="store_true",
     help="Don't do scale search during AWQ, use the scale from weight quantization directly",
@@ -132,6 +139,7 @@ q_config = {
     "debug": args.quant_debug,
     "codebook_spread": args.codebook_spread,
     "fixed_scale":args.fixed_scale,
+    "quant_method": args.quant_method,
 }
 print("Quantization config:", q_config)
 
