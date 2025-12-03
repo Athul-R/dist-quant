@@ -250,5 +250,5 @@ def run_awq(
 
 
 def apply_awq(model, awq_results):
-    apply_scale(model, awq_results["scale"])
+    #apply_scale(model, awq_results["scale"])
     apply_clip(model, awq_results["clip"])
