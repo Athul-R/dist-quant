@@ -1,3 +1,132 @@
+# dist-quant (DACQ) — distribution-aware quantization on top of AWQ
+
+This repository is a research fork of [llm-awq](https://github.com/mit-han-lab/llm-awq) that **keeps the full AWQ implementation** and adds tools for
+studying **layer-wise weight distributions** and **distribution-aware weight quantization** (Gaussian and logistic codebooks, “DACQ” logistic companding)
+for LLaMA/Qwen-style LLMs.
+
+The goal of this branch (`dacq/fresh/siddhant`) is to:
+
+- Compare standard **AWQ** to a distribution-aware variant (**DACQ**, based on logistic companding) at the **weight / MSE level**.
+- Visualize and quantify how LLM weights align with Normal / Laplace / Logistic families across layers and submodules.
+- Provide small, reproducible scripts for **Llama-3** experiments using the extended AWQ entrypoint in this fork.
+
+## Fork-specific components
+
+- `awq/` — Upstream AWQ library, plus:
+  - New quantization options in `awq/quantize/quantizer.py` via `quant_method`:
+    - `uniform` (original AWQ behavior),
+    - `normal` (Gaussian CDF–based non-uniform codebook),
+    - `logistic` (logistic CDF–based non-uniform codebook).
+  - Extra knobs in `awq/entry.py`:
+    - `--codebook_spread` to stretch the codebook relative to the empirical std.
+    - `--fixed_scale` to optionally skip scale search and reuse the weight-quantization scale directly.
+- `llama_weight_distributions.py` — Offline **weight-distribution analyzer** for LLaMA/Qwen-style models:
+  - Samples from `.safetensors` shards without fully loading the model.
+  - Produces per-layer histograms, Q–Q overlays vs Normal/Laplace/Logistic, RMSE/MAE-in-quantile-space, metrics-vs-layer plots, and CSV summaries.
+  - Can also generate **submodule-level** stats (q/k/v/o, gate/up/down projections) and optional torchinfo / structural summaries.
+- `awq_v_dacq.py` — **AWQ vs DACQ MSE comparison** on saved AWQ weight tensors:
+  - Takes tensors produced by `awq/extract_awq_tensors.py` and compares
+    vanilla AWQ to a **logistic-companded DACQ** variant at the same bit-width.
+  - Writes per-module MSE and a combined summary into a CSV, and reports which method “wins” for each module.
+- `awq_vs_dacq_results.csv` — Example CSV output for Meta-Llama-3-8B showing per-layer, per-submodule MSE for AWQ vs DACQ and the overall winner.
+- `llama3_exps.sh` — Minimal **Llama-3-8B** experiment script using this fork’s extended `awq.entry`:
+  - Runs AWQ search with a logistic codebook:
+    - `--quant_method logistic --codebook_spread 10 --fixed_scale`
+  - Evaluates on WikiText with the same settings.
+
+## Install (this fork)
+
+Installation is identical to upstream AWQ, but you clone this repository instead:
+
+```bash
+git clone https://github.com/Athul-R/dist-quant
+cd dist-quant
+
+conda create -n dist-quant python=3.10 -y
+conda activate dist-quant
+
+pip install --upgrade pip  # enable PEP 660 support
+pip install -e .
+```
+
+For edge devices (e.g., NVIDIA Jetson Orin) and additional kernel/FlashAttention notes, please refer to the **AWQ README** preserved below.
+
+## Running the DACQ / distribution-aware experiments
+
+### 1. Llama-3-8B logistic DACQ example
+
+The included script reproduces our logistic-quantization experiments on Meta-Llama-3-8B:
+
+```bash
+bash llama3_exps.sh
+```
+
+This:
+
+1. Runs AWQ search with a **logistic** codebook and enlarged spread:
+   ```bash
+   python -m awq.entry --model_path Meta-Llama-3-8B \
+       --w_bit 4 --q_group_size 128 \
+       --run_awq --dump_awq awq_cache/llama3-8b-w4-g128-dacq.pt \
+       --quant_method logistic --codebook_spread 10 --fixed_scale
+   ```
+2. Evaluates the resulting configuration on WikiText:
+   ```bash
+   python -m awq.entry --model_path Meta-Llama-3-8B \
+       --tasks wikitext \
+       --w_bit 4 --q_group_size 128 \
+       --load_awq awq_cache/llama3-8b-w4-g128-dacq.pt \
+       --q_backend fake --quant_method logistic --codebook_spread 10
+   ```
+
+You can switch `--quant_method` between `uniform`, `normal`, and `logistic` to compare different distribution-aware schemes while keeping all other flags fixed.
+
+### 2. Weight-distribution visualizations (LLaMA / Qwen)
+
+Given a local directory or HF repo with `.safetensors` weights, a typical invocation is:
+
+```bash
+python llama_weight_distributions.py \
+  --arch llama \
+  --model_id /path/to/Meta-Llama-3-8B \
+  --local_only \
+  --do_layer_overall_plots \
+  --do_layer_metrics_csv \
+  --do_metrics_vs_layer_plot \
+  --do_summary
+```
+
+This will:
+
+- Scan the transformer layers, uniformly sample weights per layer,
+- Fit Normal / Laplace / Logistic reference distributions in quantile space,
+- Emit per-layer PNGs, metrics CSVs, an aggregate summary, and optional submodule plots/CSVs if the corresponding `--do_submodule_*` flags are enabled.
+
+### 3. AWQ vs DACQ MSE comparison on saved AWQ tensors
+
+First, extract AWQ tensors for a quantized model using the upstream-style helper:
+
+```bash
+python awq/extract_awq_tensors.py \
+  --model_path Meta-Llama-3-8B \
+  --w_bit 4 --q_group_size 128 \
+  --load_awq awq_cache/llama3-8b-w4-g128.pt \
+  --out_dir awq_extracted
+```
+
+Then run the DACQ comparison script:
+
+```bash
+python awq_v_dacq.py \
+  --awq-dir awq_extracted \
+  --bit-width 4 \
+  --csv-out awq_vs_dacq_results.csv
+```
+
+This computes the tensor-level MSE of **vanilla AWQ** and **logistic DACQ** (with per-channel fits) against the same AWQ-scaled reference weights and writes both per-module and aggregate results into the CSV (an example is checked in as `awq_vs_dacq_results.csv`).
+
+---
+
 # AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration 
 [[Paper](https://arxiv.org/abs/2306.00978)][[Website](https://hanlab.mit.edu/projects/awq)]
 
