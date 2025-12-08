@@ -78,6 +78,28 @@ parser.add_argument(
     choices=["real", "fake"],
     help="Quantization backend. 'real' = real int weights; 'fake' not recommended here",
 )
+parser.add_argument(
+    "--global_q_group",
+    action="store_true",
+    help="Treat the entire weight matrix as a single group during quantization",
+)
+parser.add_argument(
+    "--plot_quant_dists",
+    action="store_true",
+    help="Save histograms of original vs quantized weights for the first decoder layer",
+)
+parser.add_argument(
+    "--plot_quant_groups",
+    type=int,
+    default=4,
+    help="Number of groups to visualize when --plot_quant_dists is enabled",
+)
+parser.add_argument(
+    "--plot_quant_dir",
+    type=str,
+    default="quant_plots",
+    help="Directory to store weight distribution plots",
+)
 
 # Save/load real quantized weights
 parser.add_argument("--dump_quant", type=str, default=None,
@@ -106,6 +128,10 @@ max_memory = {(int(k) if k.isdigit() else k): v for k, v in max_memory}
 q_config = {
     "zero_point": not args.no_zero_point,
     "q_group_size": args.q_group_size,
+    "plot_quant_dists": args.plot_quant_dists,
+    "plot_quant_groups": args.plot_quant_groups,
+    "plot_quant_dir": args.plot_quant_dir,
+    "global_q_group": args.global_q_group,
 }
 print("Quantization config:", q_config)
 

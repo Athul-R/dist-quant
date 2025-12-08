@@ -58,6 +58,28 @@ parser.add_argument("--w_bit", type=int, default=None)
 parser.add_argument("--q_group_size", type=int, default=-1)
 parser.add_argument("--no_zero_point", action="store_true", help="disable zero_point")
 parser.add_argument("--q_backend", type=str, default="fake", choices=["fake", "real"])
+parser.add_argument(
+    "--global_q_group",
+    action="store_true",
+    help="Treat the entire weight matrix as a single group during quantization",
+)
+parser.add_argument(
+    "--plot_quant_dists",
+    action="store_true",
+    help="Save histograms of original vs quantized weights for the first decoder layer",
+)
+parser.add_argument(
+    "--plot_quant_groups",
+    type=int,
+    default=4,
+    help="Number of groups to visualize when --plot_quant_dists is enabled",
+)
+parser.add_argument(
+    "--plot_quant_dir",
+    type=str,
+    default="quant_plots",
+    help="Directory to store weight distribution plots",
+)
 # save/load real quantized weights
 parser.add_argument("--dump_quant", type=str, default=None, help="save quantized model")
 parser.add_argument(
@@ -119,6 +141,10 @@ if args.auto_parallel:
 q_config = {
     "zero_point": not args.no_zero_point,  # by default True
     "q_group_size": args.q_group_size,  # whether to use group quantization
+    "plot_quant_dists": args.plot_quant_dists,
+    "plot_quant_groups": args.plot_quant_groups,
+    "plot_quant_dir": args.plot_quant_dir,
+    "global_q_group": args.global_q_group,
 }
 print("Quantization config:", q_config)
 
@@ -253,6 +279,7 @@ def build_model_and_enc(model_path, dtype):
 
         model.eval()
 
+        awq_results = None
         if args.run_awq:
             assert args.dump_awq, "Please save the awq results with --dump_awq"
 
@@ -278,13 +305,22 @@ def build_model_and_enc(model_path, dtype):
             awq_results = torch.load(args.load_awq, map_location="cpu")
             apply_awq(model, awq_results)
 
+        awq_scale_records = (
+            awq_results.get("scale") if isinstance(awq_results, dict) else None
+        )
+
         # weight quantization
         if args.w_bit is not None:
             if args.q_backend == "fake":
                 assert (
                     args.dump_quant is None
                 ), "Need to use real quantization to dump quantized weights"
-                pseudo_quantize_model_weight(model, w_bit=args.w_bit, q_config=q_config)
+                pseudo_quantize_model_weight(
+                    model,
+                    w_bit=args.w_bit,
+                    q_config=q_config,
+                    awq_scale_records=awq_scale_records,
+                )
                 if args.dump_fake:
                     model.save_pretrained(args.dump_fake)
                     print("Pseudo-quantized models saved at", args.dump_fake)

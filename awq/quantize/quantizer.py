@@ -1,11 +1,17 @@
 import math
+import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 import gc
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from .qmodule import ScaledActivation
-from ..utils.module import set_op_by_name
+from ..utils.module import get_op_name, set_op_by_name
 
 from transformers.models.bloom.modeling_bloom import BloomBlock
 
@@ -61,13 +67,23 @@ def scale_activations(module):
 
 # core quantization method (simulated quantization)
 def pseudo_quantize_tensor_uniform(
-    w, n_bit=8, zero_point=True, q_group_size=-1, inplace=False, get_scale_zp=False, **kwargs
+    w,
+    n_bit=8,
+    zero_point=True,
+    q_group_size=-1,
+    inplace=False,
+    get_scale_zp=False,
+    global_q_group=False,
+    **kwargs,
 ):
     org_w_shape = w.shape
-    if q_group_size > 0:
+    if global_q_group:
+        w = w.reshape(1, -1)
+    elif q_group_size > 0:
         assert org_w_shape[-1] % q_group_size == 0
         w = w.reshape(-1, q_group_size)
     assert w.dim() == 2
+    num_groups = w.shape[0]
     if zero_point:
         max_val = w.amax(dim=1, keepdim=True)
         min_val = w.amin(dim=1, keepdim=True)
@@ -100,14 +116,16 @@ def pseudo_quantize_tensor_uniform(
     w = w.reshape(org_w_shape)
 
     if get_scale_zp:
-        return w, scales.view(w.shape[0], -1), zeros.view(w.shape[0], -1)
+        return w, scales.view(num_groups, -1), zeros.view(num_groups, -1)
     else:
         return w
 
 
-def _reshape_for_group_quantization(w, q_group_size):
+def _reshape_for_group_quantization(w, q_group_size, global_q_group=False):
     org_shape = w.shape
-    if q_group_size > 0:
+    if global_q_group:
+        w_2d = w.reshape(1, -1)
+    elif q_group_size > 0:
         assert org_shape[-1] % q_group_size == 0
         w_2d = w.reshape(-1, q_group_size)
     else:
@@ -139,6 +157,297 @@ def _assert_finite(tensor):
     assert torch.isfinite(tensor).all()
 
 
+def _select_group_indices(total_groups, max_groups, salient_counts=None):
+    max_groups = max(1, int(max_groups))
+    if total_groups <= max_groups:
+        indices = list(range(total_groups))
+    else:
+        step = total_groups / max_groups
+        indices = []
+        for i in range(max_groups):
+            idx = min(total_groups - 1, int(round(i * step)))
+            if idx not in indices:
+                indices.append(idx)
+        if len(indices) < max_groups:
+            # backfill with trailing indices if rounding produced duplicates
+            candidate = total_groups - 1
+            while len(indices) < max_groups and candidate >= 0:
+                if candidate not in indices:
+                    indices.append(candidate)
+                candidate -= 1
+    if salient_counts is not None:
+        salient_counts = np.asarray(salient_counts).flatten()
+        if salient_counts.shape[0] == total_groups:
+            ranked = np.argsort(-salient_counts)
+            for idx in ranked:
+                if salient_counts[idx] <= 0:
+                    break
+                if idx not in indices:
+                    indices.append(int(idx))
+                if len(indices) >= max_groups:
+                    break
+    return sorted(indices)
+
+
+def _build_scale_lookup(scale_records):
+    lookup = {}
+    if not scale_records:
+        return lookup
+    for record in scale_records:
+        if not isinstance(record, (list, tuple)) or len(record) < 3:
+            continue
+        _, layer_names, scales = record
+        if scales is None:
+            continue
+        if not isinstance(layer_names, (list, tuple)):
+            layer_names = (layer_names,)
+        for name in layer_names:
+            lookup[name] = scales
+    return lookup
+
+
+def _build_salient_group_mask(
+    weight_tensor,
+    column_scales,
+    q_group_size,
+    global_q_group=False,
+    top_ratio=0.1,
+):
+    if column_scales is None or weight_tensor is None:
+        return None
+    if top_ratio <= 0:
+        return None
+    weight_last_dim = weight_tensor.shape[-1]
+    if not torch.is_tensor(column_scales):
+        column_scales = torch.as_tensor(column_scales)
+    scales_flat = column_scales.detach().float().view(-1).cpu()
+    if scales_flat.numel() == 0 or scales_flat.numel() != weight_last_dim:
+        return None
+    num_salient = max(1, int(math.ceil(scales_flat.numel() * top_ratio)))
+    topk = torch.topk(scales_flat, num_salient, largest=True)
+    salient_columns = torch.zeros_like(scales_flat, dtype=torch.bool)
+    salient_columns.scatter_(0, topk.indices, True)
+    salient_columns = salient_columns.to(weight_tensor.device)
+    # Broadcast column selection across leading dimensions
+    while salient_columns.dim() < weight_tensor.dim():
+        salient_columns = salient_columns.unsqueeze(0)
+    expand_shape = tuple(weight_tensor.shape)
+    salient_mask = salient_columns.expand(expand_shape).to(torch.bool)
+    salient_mask_2d, _ = _reshape_for_group_quantization(
+        salient_mask, q_group_size, global_q_group=global_q_group
+    )
+    return salient_mask_2d
+
+
+def _compute_weight_scale_product(weight_tensor, column_scales):
+    if weight_tensor is None or column_scales is None:
+        return None
+    if not torch.is_tensor(column_scales):
+        column_scales = torch.as_tensor(column_scales)
+    scales = column_scales.detach().to(weight_tensor.dtype).view(-1)
+    if scales.numel() != weight_tensor.shape[-1]:
+        return None
+    view_shape = [1] * (weight_tensor.dim() - 1) + [weight_tensor.shape[-1]]
+    scales = scales.view(*view_shape)
+    return weight_tensor * scales
+
+
+def _render_histogram_with_salient(
+    ax,
+    values,
+    salient_values,
+    bins=80,
+    base_color="steelblue",
+    salient_color="crimson",
+):
+    if values is None or values.size == 0:
+        return
+    total_counts, bin_edges = np.histogram(values, bins=bins)
+    total = max(1, total_counts.sum())
+    widths = np.diff(bin_edges)
+    base_counts = total_counts.astype(np.int64)
+    salient_freq = None
+    if salient_values is not None and salient_values.size > 0:
+        salient_counts, _ = np.histogram(salient_values, bins=bin_edges)
+        salient_counts = np.minimum(salient_counts, base_counts)
+        base_counts = base_counts - salient_counts
+        salient_freq = salient_counts.astype(np.float32) / total
+    base_freq = base_counts.astype(np.float32) / total
+    ax.bar(
+        bin_edges[:-1],
+        base_freq,
+        width=widths,
+        align="edge",
+        color=base_color,
+        alpha=0.75,
+        label="Other weights",
+    )
+    if salient_freq is not None and np.any(salient_freq):
+        ax.bar(
+            bin_edges[:-1],
+            salient_freq,
+            width=widths,
+            align="edge",
+            bottom=base_freq,
+            color=salient_color,
+            alpha=0.9,
+            label="Top 10% scale",
+        )
+        ax.legend(frameon=False, fontsize=8)
+
+
+def _plot_weight_distributions(
+    w_before,
+    w_after,
+    q_group_size,
+    layer_idx,
+    module_name,
+    max_groups,
+    output_dir,
+    global_q_group=False,
+    salient_mask=None,
+    scaled_weight=None,
+):
+    os.makedirs(output_dir, exist_ok=True)
+    w_before_2d, _ = _reshape_for_group_quantization(
+        w_before, q_group_size, global_q_group=global_q_group
+    )
+    w_after_2d, _ = _reshape_for_group_quantization(
+        w_after, q_group_size, global_q_group=global_q_group
+    )
+    w_scaled_2d = None
+    if scaled_weight is not None:
+        w_scaled_2d, _ = _reshape_for_group_quantization(
+            scaled_weight, q_group_size, global_q_group=global_q_group
+        )
+    total_groups = w_before_2d.shape[0]
+    salient_counts = None
+    if salient_mask is not None:
+        salient_counts = (
+            salient_mask.to(torch.float32).sum(dim=1).detach().cpu().numpy()
+        )
+    group_indices = _select_group_indices(
+        total_groups, max_groups, salient_counts=salient_counts
+    )
+    safe_module_name = module_name.replace(".", "_")
+
+    for group_idx in group_indices:
+        orig_vals = (
+            w_before_2d[group_idx].detach().to(torch.float32).cpu().numpy().ravel()
+        )
+        quant_vals = (
+            w_after_2d[group_idx].detach().to(torch.float32).cpu().numpy().ravel()
+        )
+        diff = quant_vals - orig_vals
+        mae = float(np.mean(np.abs(diff)))
+        mse = float(np.mean(diff ** 2))
+        max_err = float(np.max(np.abs(diff)))
+        # cosine similarity between original and quantized vectors
+        orig_vec = torch.from_numpy(orig_vals)
+        quant_vec = torch.from_numpy(quant_vals)
+        if orig_vec.norm().item() < 1e-12 or quant_vec.norm().item() < 1e-12:
+            cos_sim = float("nan")
+        else:
+            cos_sim = F.cosine_similarity(
+                orig_vec.view(1, -1), quant_vec.view(1, -1), dim=1
+            ).item()
+        range_ratio = float(
+            (orig_vals.max() - orig_vals.min())
+            / (quant_vals.max() - quant_vals.min() + 1e-12)
+        )
+        num_axes = 2 + (1 if w_scaled_2d is not None else 0)
+        fig, axes = plt.subplots(1, num_axes, figsize=(6 * num_axes, 4))
+        if num_axes == 1:
+            axes = [axes]
+        elif isinstance(axes, np.ndarray):
+            axes = list(axes.reshape(-1))
+        group_salient_mask = None
+        if salient_mask is not None and group_idx < salient_mask.shape[0]:
+            group_salient_mask = (
+                salient_mask[group_idx]
+                .detach()
+                .to(torch.bool)
+                .cpu()
+                .numpy()
+                .astype(bool)
+            )
+            if group_salient_mask.shape[0] != orig_vals.shape[0]:
+                group_salient_mask = None
+        salient_orig = None
+        if group_salient_mask is not None and np.any(group_salient_mask):
+            salient_orig = orig_vals[group_salient_mask]
+        _render_histogram_with_salient(
+            axes[0],
+            orig_vals,
+            salient_orig,
+            base_color="steelblue",
+            salient_color="crimson",
+        )
+        axes[0].set_title("Weight distribution (original)")
+        axes[0].set_xlabel("Value")
+        axes[0].set_ylabel("Normalized frequency")
+        salient_quant = None
+        if group_salient_mask is not None and np.any(group_salient_mask):
+            salient_quant = quant_vals[group_salient_mask]
+        _render_histogram_with_salient(
+            axes[1],
+            quant_vals,
+            salient_quant,
+            base_color="darkorange",
+            salient_color="darkred",
+        )
+        axes[1].set_title("Weight distribution (quantized)")
+        axes[1].set_xlabel("Value")
+        axes[1].set_ylabel("Normalized frequency")
+        if w_scaled_2d is not None:
+            scaled_vals = (
+                w_scaled_2d[group_idx].detach().to(torch.float32).cpu().numpy().ravel()
+            )
+            salient_scaled = None
+            if (
+                group_salient_mask is not None
+                and np.any(group_salient_mask)
+                and scaled_vals.shape[0] == group_salient_mask.shape[0]
+            ):
+                salient_scaled = scaled_vals[group_salient_mask]
+            _render_histogram_with_salient(
+                axes[2],
+                scaled_vals,
+                salient_scaled,
+                base_color="seagreen",
+                salient_color="darkgreen",
+            )
+            axes[2].set_title("Weight distribution (w × scale)")
+            axes[2].set_xlabel("Value")
+            axes[2].set_ylabel("Normalized frequency")
+        metrics_text = (
+            f"MAE: {mae:.3e}\n"
+            f"MSE: {mse:.3e}\n"
+            f"Max |err|: {max_err:.3e}\n"
+            f"Cos sim: {cos_sim:.4f}\n"
+            f"Range ratio: {range_ratio:.3f}"
+        )
+        axes[min(1, len(axes) - 1)].text(
+            0.02,
+            0.95,
+            metrics_text,
+            transform=axes[min(1, len(axes) - 1)].transAxes,
+            va="top",
+            ha="left",
+            fontsize=9,
+            bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+        )
+        fig.suptitle(
+            f"Layer {layer_idx} · {module_name} · Group {group_idx}"
+        )
+        fig.tight_layout()
+        plot_name = (
+            f"layer{layer_idx}_module{safe_module_name}_group{group_idx}.png"
+        )
+        fig.savefig(os.path.join(output_dir, plot_name), dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+
 def pseudo_quantize_tensor_normal(
     w,
     n_bit=8,
@@ -150,6 +459,7 @@ def pseudo_quantize_tensor_normal(
     debug_prefix=None,
     get_scale_zp=False,
     codebook_spread=1.0,
+    global_q_group=False,
     **kwargs
 ):
     """
@@ -183,7 +493,9 @@ def pseudo_quantize_tensor_normal(
             "Use pseudo_quantize_tensor_old for kernels that require them."
         )
 
-    w_2d, org_shape = _reshape_for_group_quantization(w, q_group_size)
+    w_2d, org_shape = _reshape_for_group_quantization(
+        w, q_group_size, global_q_group=global_q_group
+    )
     num_rows, _ = w_2d.shape
 
     num_levels = 2 ** n_bit
@@ -251,6 +563,7 @@ def pseudo_quantize_tensor_logistic(
     debug_prefix=None,
     get_scale_zp=False,
     codebook_spread=1.0,
+    global_q_group=False,
     **kwargs,
 ):
     """Non-uniform quantization using a logistic distribution derived codebook."""
@@ -260,7 +573,9 @@ def pseudo_quantize_tensor_logistic(
             "Logistic pseudo quantization does not expose (scale, zero_point)."
         )
 
-    w_2d, org_shape = _reshape_for_group_quantization(w, q_group_size)
+    w_2d, org_shape = _reshape_for_group_quantization(
+        w, q_group_size, global_q_group=global_q_group
+    )
     num_levels = 2 ** n_bit
     device = w.device
     dtype = w.dtype
@@ -367,21 +682,72 @@ def pseudo_quantize_model_weight(
     model,
     w_bit,
     q_config,
+    awq_scale_records=None,
 ):
     from .pre_quant import get_blocks, get_named_linears
 
     layers = get_blocks(model)
     debug_enabled = q_config.get("debug", False)
+    plot_enabled = q_config.get("plot_quant_dists", False)
+    max_plot_groups = q_config.get("plot_quant_groups", 4)
+    plot_dir = q_config.get("plot_quant_dir", "quant_plots")
+    awq_scale_lookup = _build_scale_lookup(awq_scale_records)
     for i in tqdm(range(len(layers)), desc="pseudo weight quantization..."):
         named_linears = get_named_linears(layers[i])
+        layer_prefix = get_op_name(model, layers[i])
+        if layer_prefix:
+            layer_prefix = layer_prefix + "."
         for n, m in named_linears.items():
+            full_module_name = f"{layer_prefix}{n}" if layer_prefix else n
+            module_scales = awq_scale_lookup.get(full_module_name)
             m.cuda()
             extra_kwargs = {}
             if debug_enabled:
                 extra_kwargs["debug_prefix"] = f"layer_{i}.{n}"
+            w_before_cpu = None
+            w_before_scaled_cpu = None
+            if plot_enabled and i == 0:
+                w_before_cpu = m.weight.data.detach().cpu().clone()
+                if module_scales is not None:
+                    w_before_scaled_cpu = _compute_weight_scale_product(
+                        w_before_cpu, module_scales
+                    )
             m.weight.data = pseudo_quantize_tensor(
                 m.weight.data, n_bit=w_bit, **q_config, **extra_kwargs
             )
+            if w_before_cpu is not None:
+                try:
+                    w_after_cpu = m.weight.data.detach().cpu().clone()
+                    salient_mask = None
+                    if module_scales is not None:
+                        salient_mask = _build_salient_group_mask(
+                            w_before_cpu,
+                            module_scales,
+                            q_config.get("q_group_size", -1),
+                            global_q_group=q_config.get("global_q_group", False),
+                            top_ratio=0.1,
+                        )
+                    _plot_weight_distributions(
+                        w_before_cpu,
+                        w_after_cpu,
+                        q_config.get("q_group_size", -1),
+                        layer_idx=i,
+                        module_name=n,
+                        max_groups=max_plot_groups,
+                        output_dir=plot_dir,
+                        global_q_group=q_config.get("global_q_group", False),
+                        salient_mask=salient_mask,
+                        scaled_weight=w_before_scaled_cpu,
+                    )
+                    del w_after_cpu
+                except Exception as exc:
+                    print(
+                        f"[quant-plot] Failed to save plot for layer {i} {n}: {exc}"
+                    )
+                finally:
+                    del w_before_cpu
+                    if w_before_scaled_cpu is not None:
+                        del w_before_scaled_cpu
             m.cpu()
 
 

@@ -71,6 +71,28 @@ parser.add_argument(
     help="Pseudo quantization scheme to simulate (uniform, Gaussian, or logistic)",
 )
 parser.add_argument(
+    "--global_q_group",
+    action="store_true",
+    help="Treat the entire weight matrix as a single group during quantization",
+)
+parser.add_argument(
+    "--plot_quant_dists",
+    action="store_true",
+    help="Save histograms of original vs quantized weights for the first decoder layer",
+)
+parser.add_argument(
+    "--plot_quant_groups",
+    type=int,
+    default=4,
+    help="Number of groups to visualize when --plot_quant_dists is enabled",
+)
+parser.add_argument(
+    "--plot_quant_dir",
+    type=str,
+    default="quant_plots",
+    help="Directory to store weight distribution plots",
+)
+parser.add_argument(
     "--fixed_scale",
     action="store_true",
     help="Don't do scale search during AWQ, use the scale from weight quantization directly",
@@ -140,6 +162,10 @@ q_config = {
     "codebook_spread": args.codebook_spread,
     "fixed_scale":args.fixed_scale,
     "quant_method": args.quant_method,
+    "plot_quant_dists": args.plot_quant_dists,
+    "plot_quant_groups": args.plot_quant_groups,
+    "plot_quant_dir": args.plot_quant_dir,
+    "global_q_group": args.global_q_group,
 }
 print("Quantization config:", q_config)
 
@@ -224,6 +250,7 @@ def build_model_and_enc(model_path, dtype):
 
         model.eval()
 
+        awq_results = None
         if args.run_awq:
             assert args.dump_awq, "Please save the awq results with --dump_awq"
 
@@ -247,7 +274,13 @@ def build_model_and_enc(model_path, dtype):
         if args.load_awq:
             print("Loading pre-computed AWQ results from", args.load_awq)
             awq_results = torch.load(args.load_awq, map_location="cpu")
+            # awq_results_scale = torch.load('awq_cache/llama3-8b-w4-g128.pt', map_location="cpu")
+            # awq_results['scale'] = awq_results_scale['scale']
             apply_awq(model, awq_results)
+
+        awq_scale_records = (
+            awq_results.get("scale") if isinstance(awq_results, dict) else None
+        )
 
         # weight quantization
         if args.w_bit is not None:
@@ -255,7 +288,12 @@ def build_model_and_enc(model_path, dtype):
                 assert (
                     args.dump_quant is None
                 ), "Need to use real quantization to dump quantized weights"
-                pseudo_quantize_model_weight(model, w_bit=args.w_bit, q_config=q_config)
+                pseudo_quantize_model_weight(
+                    model,
+                    w_bit=args.w_bit,
+                    q_config=q_config,
+                    awq_scale_records=awq_scale_records,
+                )
                 if args.dump_fake:
                     model.save_pretrained(args.dump_fake)
                     print("Pseudo-quantized models saved at", args.dump_fake)
