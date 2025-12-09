@@ -616,6 +616,118 @@ def pseudo_quantize_tensor_logistic(
         return w_q
 
 
+
+def pseudo_quantize_tensor_hybrid(
+    w,
+    n_bit=8,
+    q_group_size=-1,
+    inplace=False,
+    get_codebook=False,
+    zero_point=True,
+    debug=False,
+    debug_prefix=None,
+    get_scale_zp=False,
+    codebook_spread=1.0,
+    global_q_group=False,
+    alpha=None,
+    **kwargs,
+):
+    """
+    Hybrid Uniform-Logistic quantization.
+    Mixes Logistic (density-matching) and Uniform (range-matching) centroids.
+    
+    If `alpha` is None, performs a grid search to find the best alpha per-group.
+    Alpha 0.0 = Pure Logistic
+    Alpha 1.0 = Pure Uniform
+    """
+
+    if get_scale_zp:
+        raise NotImplementedError(
+            "Hybrid pseudo quantization does not expose (scale, zero_point)."
+        )
+
+    w_2d, org_shape = _reshape_for_group_quantization(
+        w, q_group_size, global_q_group=global_q_group
+    )
+    # w_2d: (num_rows, row_dim)
+    
+    num_levels = 2 ** n_bit
+    device = w.device
+    dtype = w.dtype
+    working_dtype = (
+        torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+    )
+
+    # --- 1. Compute Base Statistics ---
+    # Logistic components
+    mean = w_2d.mean(dim=1, keepdim=True)
+    var = w_2d.var(dim=1, unbiased=False, keepdim=True)
+    std = var.clamp(min=1e-5).sqrt()
+    spread_std = std * codebook_spread
+    logistic_scale = (spread_std * math.sqrt(3.0) / math.pi).clamp(min=1e-5)
+    
+    k = torch.arange(num_levels, device=device, dtype=working_dtype)
+    p = (k + 0.5) / num_levels
+    z_logistic = torch.logit(p, eps=1e-6)
+    if z_logistic.dtype != dtype:
+        z_logistic = z_logistic.to(dtype)
+    
+    # Centers if pure Logistic
+    # shape: (num_rows, num_levels)
+    centers_logistic = mean + logistic_scale * z_logistic.unsqueeze(0)
+
+    # Uniform components
+    # We want max_val such that [-max_val, max_val] covers the range?
+    # Or just min/max? Uniform usually means linear spacing between min(w) and max(w).
+    # Let's use simple min/max of the row.
+    row_min = w_2d.amin(dim=1, keepdim=True)
+    row_max = w_2d.amax(dim=1, keepdim=True)
+    
+    # Linear spacing from min to max
+    # step = (max - min) / (2^n - 1)
+    # levels = min + step * k
+    step = (row_max - row_min).clamp(min=1e-5) / (num_levels - 1)
+    k_idx = torch.arange(num_levels, device=device, dtype=dtype) # Use weight dtype
+    centers_uniform = row_min + step * k_idx.unsqueeze(0)
+
+    alpha_val = alpha if alpha is not None else 0.5 # Default to 0.5 if not found
+    
+    # If alpha_val is a tensor, we need to broadcast/reshape it to match (num_rows, num_levels)
+    # alpha_val might be (co, n_group) or (num_rows,)
+    # w_2d is (num_rows, row_dim)
+    # centers is (num_rows, num_levels)
+    
+    if torch.is_tensor(alpha_val):
+        alpha_val = alpha_val.to(device).to(working_dtype)
+        # Assuming alpha_val is (num_rows,) or broadcastable to (num_rows, 1)
+        if alpha_val.dim() == 1 and alpha_val.numel() == w_2d.shape[0]:
+             alpha_val = alpha_val.unsqueeze(1) # (num_rows, 1)
+        # If it was (co, ngroup), it should have been reshaped before passing here?
+        # Ideally, passed alpha should match the grouping of w_2d.
+        
+    best_centers = (1 - alpha_val) * centers_logistic + alpha_val * centers_uniform
+
+    # --- 3. Final Quantization ---
+    w_q_2d, idx = _assign_to_codebook(w_2d, best_centers)
+
+    if debug:
+        _log_non_uniform_quant_stats(
+            debug_prefix or "pseudo_quantize_tensor_hybrid",
+            w_2d,
+            w_q_2d,
+            best_centers,
+            idx,
+        )
+
+    w_q = _restore_quantized_weights(w, w_q_2d, q_group_size, org_shape, inplace)
+    _assert_finite(w_q)
+
+    if get_codebook:
+        return w_q, best_centers
+    else:
+        return w_q
+
+
 def pseudo_quantize_tensor(
     w,
     *args,
@@ -638,6 +750,8 @@ def pseudo_quantize_tensor(
         return pseudo_quantize_tensor_normal(w, *args, **kwargs)
     if method == "logistic":
         return pseudo_quantize_tensor_logistic(w, *args, **kwargs)
+    if method in ("hybrid", "saliency", "saliency_aware"):
+        return pseudo_quantize_tensor_hybrid(w, *args, **kwargs)
 
     raise ValueError(f"Unsupported quantization method: {method}")
 
@@ -677,12 +791,30 @@ def _log_non_uniform_quant_stats(prefix, w_orig, w_quant, centers, idx):
 
 
 
+def _build_alpha_lookup(alpha_records):
+    lookup = {}
+    if not alpha_records:
+        return lookup
+    for record in alpha_records:
+        if not isinstance(record, (list, tuple)) or len(record) < 2:
+            continue
+        _, layer_names, alphas = record
+        if alphas is None:
+            continue
+        if not isinstance(layer_names, (list, tuple)):
+            layer_names = (layer_names,)
+        for name in layer_names:
+            lookup[name] = alphas
+    return lookup
+
+
 @torch.no_grad()
 def pseudo_quantize_model_weight(
     model,
     w_bit,
     q_config,
     awq_scale_records=None,
+    awq_alpha_records=None,
 ):
     from .pre_quant import get_blocks, get_named_linears
 
@@ -691,7 +823,10 @@ def pseudo_quantize_model_weight(
     plot_enabled = q_config.get("plot_quant_dists", False)
     max_plot_groups = q_config.get("plot_quant_groups", 4)
     plot_dir = q_config.get("plot_quant_dir", "quant_plots")
+    
     awq_scale_lookup = _build_scale_lookup(awq_scale_records)
+    awq_alpha_lookup = _build_alpha_lookup(awq_alpha_records)
+    
     for i in tqdm(range(len(layers)), desc="pseudo weight quantization..."):
         named_linears = get_named_linears(layers[i])
         layer_prefix = get_op_name(model, layers[i])
@@ -700,10 +835,23 @@ def pseudo_quantize_model_weight(
         for n, m in named_linears.items():
             full_module_name = f"{layer_prefix}{n}" if layer_prefix else n
             module_scales = awq_scale_lookup.get(full_module_name)
+            module_alphas = awq_alpha_lookup.get(full_module_name)
+            
             m.cuda()
             extra_kwargs = {}
             if debug_enabled:
                 extra_kwargs["debug_prefix"] = f"layer_{i}.{n}"
+            
+            # Pass alpha if available
+            if module_alphas is not None:
+                # module_alphas: [co, n_group]
+                # We need to flatten it to match w_groups: [co * n_group] or [co, n_group] ?
+                # pseudo_quantize_tensor_hybrid reshapes w to (num_rows, -1). 
+                # If q_group_size > 0: num_rows = co * (ci / group_size)
+                # module_alphas shape is [co, ci / group_size].
+                # So flattening it to (-1) should align with rows of w_2d.
+                extra_kwargs["alpha"] = module_alphas.view(-1)
+                
             w_before_cpu = None
             w_before_scaled_cpu = None
             if plot_enabled and i == 0:

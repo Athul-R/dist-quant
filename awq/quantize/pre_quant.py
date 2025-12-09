@@ -18,6 +18,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 
 from .auto_scale import auto_scale_block, apply_scale
 from .auto_clip import auto_clip_block, apply_clip
+from .auto_alpha import auto_alpha_block
 
 __all__ = ["run_awq"]
 
@@ -235,6 +236,19 @@ def run_awq(
             # append prefix to make names global
             awq_results["clip"] += append_str_prefix(
                 clip_list, get_op_name(model, layer) + "."
+            )
+
+        if q_config.get("quant_method", "uniform") == "hybrid":
+             alpha_list = auto_alpha_block(
+                layer,
+                w_bit=w_bit,
+                q_config=q_config,
+                input_feat=input_feat,
+            )
+             if "alpha" not in awq_results:
+                 awq_results["alpha"] = []
+             awq_results["alpha"] += append_str_prefix(
+                alpha_list, get_op_name(model, layer) + "."
             )
 
         layer = layer.cpu()
