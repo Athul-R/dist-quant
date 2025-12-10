@@ -1,5 +1,5 @@
 ==== Reproducibility ====
-timestamp_utc: 2025-12-10T22:18:36.718396+00:00
+timestamp_utc: 2025-12-10T23:17:26.939761+00:00
 model_id: ../../../Meta-Llama-3-8B
 revision: None
 sample_per_layer: 2000000
