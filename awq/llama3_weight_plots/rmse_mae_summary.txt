@@ -1,0 +1,26 @@
+==== Reproducibility ====
+timestamp_utc: 2025-12-10T07:25:51.172351+00:00
+model_id: ../../../Meta-Llama-3-8B
+revision: None
+sample_per_layer: 2000000
+bins: 200
+seed: 123
+
+Layers counted: 32/32
+
+RMSE (quantile-space):
+  Normal  : mean=0.064997, std=0.015139
+  Laplace : mean=0.129452, std=0.014876
+  Logistic: mean=0.036828, std=0.006687
+
+MAE (quantile-space):
+  Normal  : mean=0.049695, std=0.011627
+  Laplace : mean=0.096109, std=0.011544
+  Logistic: mean=0.017589, std=0.005429
+
+Artifacts (presence depends on flags):
+  - Per-layer histograms and Q–Q: layer_{##}_weights.png
+  - RMSE/MAE vs Layer: metrics_vs_layer.png
+  - Per-layer metrics CSV: layer_metrics.csv
+  - Submodule figures: submodules/layer_##_attn_submodules.png, submodules/layer_##_mlp_submodules.png
+  - Submodule metrics CSV: submodule_metrics.csv
