@@ -35,16 +35,21 @@ def auto_alpha_layer(
     best_alpha_all = []
     
     # Alpha candidates: 0.0 (Logistic) to 1.0 (Uniform)
-    alpha_candidates = [0.0, 0.25, 0.5, 0.75, 1.0]
+    alpha_candidates = [x/20 for x in range(21)] # [0.0, 0.25, 0.5, 0.75, 1.0]
     
     for i_b in range(w_groups.shape[0] // oc_batch_size):
         w_batch = w_all[i_b * oc_batch_size : (i_b + 1) * oc_batch_size]
         
         # [co_batch, 1, n_group, 1]
-        best_loss = torch.ones(w_batch.shape[0], 1, w_batch.shape[2], 1, device=w.device) * 1e9
+        best_loss = torch.full(
+            (w_batch.shape[0], 1, w_batch.shape[2], 1),
+            float("inf"),
+            device=w.device,
+            dtype=torch.float32,
+        )
         best_alpha = torch.zeros_like(best_loss)
         
-        input_feat_gpu = input_feat.to(w.device)
+        input_feat_gpu = input_feat.to(w.device).float()
         
         # Compute original output for comparison? 
         # Actually min ||(w - q)x||^2 is same as min ||wx - qx||^2
@@ -52,7 +57,7 @@ def auto_alpha_layer(
         # But to be precise let's match auto_clip style:
         # auto_clip computes err = (cur_out - org_out)^2
         
-        org_out = (input_feat_gpu * w_batch).sum(dim=-1) # [co, n_token, n_group]
+        org_out = (input_feat_gpu * w_batch).sum(dim=-1).float() # [co, n_token, n_group]
         
         for alpha in alpha_candidates:
             # Quantize with this alpha
@@ -73,18 +78,17 @@ def auto_alpha_layer(
             # Safest is to reshape to [co_batch, -1] representing [co, ci] before passing.
             
             w_batch_flat = w_batch.reshape(w_batch.shape[0], -1)
-            
+            q_config["quant_method"] = "hybrid"
+            q_config["alpha"] = alpha
             q_w_flat = pseudo_quantize_tensor(
                 w_batch_flat, 
                 n_bit=n_bit, 
-                **q_config, 
-                alpha=alpha,
                 quant_method="hybrid"
             )
             
             q_w = q_w_flat.reshape(w_batch.shape)
             
-            cur_out = (input_feat_gpu * q_w).sum(dim=-1)
+            cur_out = (input_feat_gpu * q_w).sum(dim=-1).float()
             
             # Error: [co, 1, n_group, 1]
             err = (cur_out - org_out).pow(2).mean(dim=1).view(best_loss.shape)

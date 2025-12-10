@@ -67,8 +67,8 @@ parser.add_argument(
     "--quant_method",
     type=str,
     default="uniform",
-    choices=["uniform", "normal", "logistic"],
-    help="Pseudo quantization scheme to simulate (uniform, Gaussian, or logistic)",
+    choices=["uniform", "normal", "logistic", "hybrid"],
+    help="Pseudo quantization scheme to simulate (uniform, Gaussian, logistic, or hybrid)",
 )
 parser.add_argument(
     "--global_q_group",
