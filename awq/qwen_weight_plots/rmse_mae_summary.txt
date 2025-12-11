@@ -1,0 +1,26 @@
+==== Reproducibility ====
+timestamp_utc: 2025-12-10T23:55:24.881389+00:00
+model_id: ../../../Qwen2.5-7B
+revision: None
+sample_per_layer: 2000000
+bins: 200
+seed: 123
+
+Layers counted: 28/28
+
+RMSE (quantile-space):
+  Normal  : mean=0.073840, std=0.037662
+  Laplace : mean=0.126464, std=0.017551
+  Logistic: mean=0.042664, std=0.026675
+
+MAE (quantile-space):
+  Normal  : mean=0.057761, std=0.033243
+  Laplace : mean=0.093779, std=0.014479
+  Logistic: mean=0.025113, std=0.026512
+
+Artifacts (presence depends on flags):
+  - Per-layer histograms and Q–Q: layer_{##}_weights.png
+  - RMSE/MAE vs Layer: metrics_vs_layer.png
+  - Per-layer metrics CSV: layer_metrics.csv
+  - Submodule figures: submodules/layer_##_attn_submodules.png, submodules/layer_##_mlp_submodules.png
+  - Submodule metrics CSV: submodule_metrics.csv
